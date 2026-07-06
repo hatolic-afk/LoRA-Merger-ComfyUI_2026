@@ -37,12 +37,28 @@ class LoraMerger:
     FUNCTION = "merge_loras"
     CATEGORY = "lora_merge"
 
-    def merge_loras(self, lora_1, lora_2=None, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float16"):
+    def merge_loras(self, lora_1, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float16", lora_2=None):
+        # ВАЖНО: параметр lora_2 должен быть последним!
+        print(f"🔍 lora_1 type: {type(lora_1)}")
+        print(f"🔍 lora_2 type: {type(lora_2)}")
+        print(f"🔍 lora_1 keys: {list(lora_1.keys()) if lora_1 else 'None'}")
+        print(f"🔍 lora_2 keys: {list(lora_2.keys()) if lora_2 else 'None'}")
+        
+        # Проверяем что обе LoRA переданы
+        if lora_2 is None:
+            print("⚠️ WARNING: lora_2 is None! Using only lora_1")
+            return (lora_1,)
+            
+        # Проверяем что в lora_2 есть данные
+        if not lora_2.get("lora", {}):
+            print("⚠️ WARNING: lora_2 has no data! Using only lora_1")
+            return (lora_1,)
+            
         result = self.merge(lora_1, lora_2, mode, rank, threshold, device, dtype)
         
         # Проверяем результат
         if not result.get("lora", {}):
-            print("⚠️ WARNING: Merged LoRA is empty!")
+            print("⚠️ WARNING: Merged LoRA is empty! Using lora_1 as fallback")
             return (lora_1,)
             
         print(f"✅ Merged LoRA has {len(result['lora'])} keys")
@@ -68,14 +84,9 @@ class LoraMerger:
         lora_1_model = lora_1.get("strength_model", 1.0)
         lora_1_clip = lora_1.get("strength_clip", 1.0)
 
-        if lora_2 is None:
-            lora_2_data = {}
-            lora_2_model = 0
-            lora_2_clip = 0
-        else:
-            lora_2_data = lora_2.get("lora", {})
-            lora_2_model = lora_2.get("strength_model", 1.0)
-            lora_2_clip = lora_2.get("strength_clip", 1.0)
+        lora_2_data = lora_2.get("lora", {})
+        lora_2_model = lora_2.get("strength_model", 1.0)
+        lora_2_clip = lora_2.get("strength_clip", 1.0)
 
         print(f"📊 LoRA 1: {len(lora_1_data)} keys, model={lora_1_model}, clip={lora_1_clip}")
         print(f"📊 LoRA 2: {len(lora_2_data)} keys, model={lora_2_model}, clip={lora_2_clip}")
@@ -117,18 +128,21 @@ class LoraMerger:
                 # Определяем, какие данные использовать
                 if key not in keys_1:
                     # Только в lora_2
+                    print(f"  • {key}: only in lora_2")
                     up, down, alpha = self._get_up_down_alpha(key, lora_2_data, lora_2_model, lora_2_clip)
                     if mode == "svd":
                         up, down = self._svd_single(up, down, rank, threshold, device, dtype)
                         
                 elif key not in keys_2:
                     # Только в lora_1
+                    print(f"  • {key}: only in lora_1")
                     up, down, alpha = self._get_up_down_alpha(key, lora_1_data, lora_1_model, lora_1_clip)
                     if mode == "svd":
                         up, down = self._svd_single(up, down, rank, threshold, device, dtype)
                         
                 else:
-                    # В обеих LoRA
+                    # В обеих LoRA - СМЕШИВАЕМ!
+                    print(f"  • {key}: merging both")
                     up_1, down_1, alpha_1 = self._get_up_down_alpha(key, lora_1_data, lora_1_model, lora_1_clip)
                     up_2, down_2, alpha_2 = self._get_up_down_alpha(key, lora_2_data, lora_2_model, lora_2_clip)
 
@@ -148,13 +162,14 @@ class LoraMerger:
                             down_1 = down_1.squeeze(2).squeeze(3)
 
                     if mode == "add":
-                        # Простое сложение
+                        # ПРОСТОЕ СЛОЖЕНИЕ - смешиваем девушку1 и девушку2
                         up = up_1 + up_2
                         down = down_1 + down_2
                         alpha = alpha_1
+                        print(f"    • ADD: up_1 + up_2, down_1 + down_2")
                         
                     elif mode == "concat":
-                        # Конкатенация
+                        # КОНКАТЕНАЦИЯ
                         r_1 = up_1.shape[1]
                         r_2 = up_2.shape[1]
                         scale_1 = math.sqrt((r_1+r_2)/r_1) if r_1 > 0 else 1.0
@@ -162,11 +177,13 @@ class LoraMerger:
                         up = torch.cat([up_1*scale_1, up_2*scale_2], dim=1)
                         down = torch.cat([down_1*scale_1, down_2*scale_2], dim=0)
                         alpha = alpha_1 + alpha_2
+                        print(f"    • CONCAT: r1={r_1}, r2={r_2}, new_rank={r_1+r_2}")
                         
                     elif mode == "svd":
                         # SVD слияние
                         up, down = self._svd_merge(up_1, down_1, up_2, down_2, rank, threshold, device)
                         alpha = torch.tensor(rank, dtype=torch.int64)
+                        print(f"    • SVD: rank={rank}")
 
                 # Сохраняем результаты
                 weight[up_key] = up
@@ -317,8 +334,7 @@ class LoraMerger:
         return index
 
     @classmethod
-    def IS_CHANGED(s, lora_1, lora_2=None, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float16"):
+    def IS_CHANGED(s, lora_1, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float16", lora_2=None):
         import hashlib
-        import json
         key_str = f"{id(lora_1)}_{id(lora_2)}_{mode}_{rank}_{threshold}_{device}_{dtype}"
         return hashlib.md5(key_str.encode()).hexdigest()
