@@ -2,6 +2,7 @@ import comfy
 import folder_paths
 import os
 import re
+import math  # <--- ДОБАВЛЯЕМ
 
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
 PRESET_FILE = os.path.join(CURRENT_DIR, "preset.txt")
@@ -162,11 +163,28 @@ class LoraLoaderWeightOnly:
                         if key in lora:
                             del lora[key]
             
+            # Теперь применяем масштабирование ко всем весам
+            if strength_model != 1.0 or strength_clip != 1.0:
+                print(f"  • Scaling weights: model={strength_model}, clip={strength_clip}")
+                for key in list(lora.keys()):
+                    if "lora_te" in key:
+                        scale = strength_clip
+                    else:
+                        scale = strength_model
+                    if scale != 1.0:
+                        sqrt_scale = math.sqrt(abs(scale))
+                        sign_scale = 1 if scale >= 0 else -1
+                        if "lora_up" in key:
+                            lora[key] = lora[key] * sqrt_scale * sign_scale
+                        elif "lora_down" in key:
+                            lora[key] = lora[key] * sqrt_scale
+                        # alpha и другие ключи не масштабируем
+            
             self.loaded_lora = (lora_path, lora)
             self.lbw = lbw
 
-        # Возвращаем структуру LoRA
-        return ({"lora": lora, "strength_model": strength_model, "strength_clip": strength_clip}, )
+        # Возвращаем структуру LoRA с силой 1.0
+        return ({"lora": lora, "strength_model": 1.0, "strength_clip": 1.0}, )
 
     @classmethod
     def IS_CHANGED(s, lora_name, strength_model, strength_clip, lbw):

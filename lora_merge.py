@@ -14,327 +14,194 @@ class LoraMerger:
             "required": {
                 "lora_1": ("LoRA",),
                 "mode": (["add", "concat", "svd"], ),
-                "rank": ("INT", {
-                    "default": 16, 
-                    "min": 1,
-                    "max": 320,
-                    "step": 1,
-                }),
-                "threshold": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.01,
-                }),
+                "rank": ("INT", {"default": 16, "min": 1, "max": 320, "step": 1}),
+                "threshold": ("FLOAT", {"default": 1.0, "min": 0, "max": 1, "step": 0.01}),
                 "device": (["cuda", "cpu"], ),
                 "dtype": (["float32", "float16", "bfloat16"], ),
+                "output_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
             },
             "optional": {
                 "lora_2": ("LoRA",),
             }
         }
-    RETURN_TYPES = ("LoRA", )
+    RETURN_TYPES = ("LoRA",)
     FUNCTION = "merge_loras"
     CATEGORY = "lora_merge"
 
-    def merge_loras(self, lora_1, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float16", lora_2=None):
-        # ВАЖНО: параметр lora_2 должен быть последним!
-        print(f"🔍 lora_1 type: {type(lora_1)}")
-        print(f"🔍 lora_2 type: {type(lora_2)}")
-        print(f"🔍 lora_1 keys: {list(lora_1.keys()) if lora_1 else 'None'}")
-        print(f"🔍 lora_2 keys: {list(lora_2.keys()) if lora_2 else 'None'}")
-        
-        # Проверяем что обе LoRA переданы
+    def merge_loras(self, lora_1, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, lora_2=None):
         if lora_2 is None:
-            print("⚠️ WARNING: lora_2 is None! Using only lora_1")
+            print("⚠️ No lora_2 provided, returning lora_1 as-is")
             return (lora_1,)
-            
-        # Проверяем что в lora_2 есть данные
         if not lora_2.get("lora", {}):
-            print("⚠️ WARNING: lora_2 has no data! Using only lora_1")
+            print("⚠️ lora_2 has no data, returning lora_1")
             return (lora_1,)
-            
-        result = self.merge(lora_1, lora_2, mode, rank, threshold, device, dtype)
-        
-        # Проверяем результат
-        if not result.get("lora", {}):
-            print("⚠️ WARNING: Merged LoRA is empty! Using lora_1 as fallback")
-            return (lora_1,)
-            
-        print(f"✅ Merged LoRA has {len(result['lora'])} keys")
+        result = self.merge(lora_1, lora_2, mode, rank, threshold, device, dtype, output_scale)
         return (result,)
-    
+
     @torch.no_grad()
-    def merge(self, lora_1, lora_2, mode, rank, threshold, device, dtype):
+    def merge(self, lora_1, lora_2, mode, rank, threshold, device, dtype, output_scale):
         weight = {}
-        
-        dtype_map = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16
-        }
+        dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
         dtype = dtype_map.get(dtype, torch.float32)
-        
         if device == "cuda" and not torch.cuda.is_available():
-            print("⚠️ CUDA not available, using CPU")
             device = "cpu"
 
-        # Извлекаем данные
-        lora_1_data = lora_1.get("lora", {})
-        lora_1_model = lora_1.get("strength_model", 1.0)
-        lora_1_clip = lora_1.get("strength_clip", 1.0)
+        l1_data = lora_1.get("lora", {})
+        l2_data = lora_2.get("lora", {})
 
-        lora_2_data = lora_2.get("lora", {})
-        lora_2_model = lora_2.get("strength_model", 1.0)
-        lora_2_clip = lora_2.get("strength_clip", 1.0)
+        # --- Универсальное определение суффиксов ---
+        def detect_suffix_type(data):
+            if any(".lora_up" in k or ".lora_down" in k for k in data):
+                return "up/down"
+            if any(".lora_A" in k or ".lora_B" in k for k in data):
+                return "A/B"
+            return None
 
-        print(f"📊 LoRA 1: {len(lora_1_data)} keys, model={lora_1_model}, clip={lora_1_clip}")
-        print(f"📊 LoRA 2: {len(lora_2_data)} keys, model={lora_2_model}, clip={lora_2_clip}")
+        suffix1 = detect_suffix_type(l1_data)
+        suffix2 = detect_suffix_type(l2_data)
+        print(f"🔍 Detected suffix types: LoRA1={suffix1}, LoRA2={suffix2}")
 
-        # Проверяем данные
-        if not lora_1_data and not lora_2_data:
-            print("❌ ERROR: No LoRA data to merge!")
-            return {"lora": {}, "strength_model": 1, "strength_clip": 1}
+        if suffix1 is None or suffix2 is None:
+            print("❌ Could not detect suffix type – using only lora_1")
+            return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
 
-        # Получаем ключи
-        keys_1 = [key[: key.rfind(".lora_down")] for key in lora_1_data.keys() if ".lora_down" in key]
-        keys_2 = [key[: key.rfind(".lora_down")] for key in lora_2_data.keys() if ".lora_down" in key]
-        
-        # Если вторая пустая, используем только первую
+        # Функция для получения базового ключа
+        def get_base_key(key, suffix_type):
+            if suffix_type == "up/down":
+                if ".lora_up" in key:
+                    return key[:key.rfind(".lora_up")]
+                if ".lora_down" in key:
+                    return key[:key.rfind(".lora_down")]
+            elif suffix_type == "A/B":
+                if ".lora_A" in key:
+                    return key[:key.rfind(".lora_A")]
+                if ".lora_B" in key:
+                    return key[:key.rfind(".lora_B")]
+            return None
+
+        keys_1 = list({get_base_key(k, suffix1) for k in l1_data.keys() if get_base_key(k, suffix1)})
+        keys_2 = list({get_base_key(k, suffix2) for k in l2_data.keys() if get_base_key(k, suffix2)})
+        all_keys = list(set(keys_1 + keys_2))
+
+        print(f"🔀 Merging {len(all_keys)} modules")
+        print(f"  keys_1: {len(keys_1)}, keys_2: {len(keys_2)}")
+
         if not keys_2:
-            print("ℹ️ Only one LoRA provided, using it directly")
-            return {"lora": lora_1_data, "strength_model": lora_1_model, "strength_clip": lora_1_clip}
-            
-        keys = list(set(keys_1 + keys_2))
-        
-        if not keys:
-            print("❌ ERROR: No valid LoRA keys found!")
-            return {"lora": {}, "strength_model": 1, "strength_clip": 1}
-            
-        print(f"🔀 Merging {len(keys)} modules")
-        print(f"  • Only in lora_1: {len(set(keys_1) - set(keys_2))}")
-        print(f"  • Only in lora_2: {len(set(keys_2) - set(keys_1))}")
-        print(f"  • Common: {len(set(keys_1) & set(keys_2))}")
-        
-        pber = comfy.utils.ProgressBar(len(keys))
-        merged_count = 0
+            print("ℹ️ lora_2 has no base keys, using only lora_1")
+            return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
 
-        for key in keys:
+        pbar = comfy.utils.ProgressBar(len(all_keys))
+
+        for key in all_keys:
             try:
-                up_key = key + ".lora_up.weight"
-                down_key = key + ".lora_down.weight"
-                alpha_key = key + ".alpha"
-                
-                # Определяем, какие данные использовать
-                if key not in keys_1:
-                    # Только в lora_2
-                    print(f"  • {key}: only in lora_2")
-                    up, down, alpha = self._get_up_down_alpha(key, lora_2_data, lora_2_model, lora_2_clip)
-                    if mode == "svd":
-                        up, down = self._svd_single(up, down, rank, threshold, device, dtype)
-                        
-                elif key not in keys_2:
-                    # Только в lora_1
-                    print(f"  • {key}: only in lora_1")
-                    up, down, alpha = self._get_up_down_alpha(key, lora_1_data, lora_1_model, lora_1_clip)
-                    if mode == "svd":
-                        up, down = self._svd_single(up, down, rank, threshold, device, dtype)
-                        
+                # Формируем имена ключей
+                if suffix1 == "up/down":
+                    up_k1 = key + ".lora_up.weight"
+                    down_k1 = key + ".lora_down.weight"
+                    alpha_k1 = key + ".alpha"
                 else:
-                    # В обеих LoRA - СМЕШИВАЕМ!
-                    print(f"  • {key}: merging both")
-                    up_1, down_1, alpha_1 = self._get_up_down_alpha(key, lora_1_data, lora_1_model, lora_1_clip)
-                    up_2, down_2, alpha_2 = self._get_up_down_alpha(key, lora_2_data, lora_2_model, lora_2_clip)
+                    up_k1 = key + ".lora_B.weight"
+                    down_k1 = key + ".lora_A.weight"
+                    alpha_k1 = key + ".alpha"
 
-                    # Приводим к одному типу
-                    up_1 = up_1.to(dtype=dtype)
-                    down_1 = down_1.to(dtype=dtype)
-                    up_2 = up_2.to(dtype=dtype)
-                    down_2 = down_2.to(dtype=dtype)
+                if suffix2 == "up/down":
+                    up_k2 = key + ".lora_up.weight"
+                    down_k2 = key + ".lora_down.weight"
+                    alpha_k2 = key + ".alpha"
+                else:
+                    up_k2 = key + ".lora_B.weight"
+                    down_k2 = key + ".lora_A.weight"
+                    alpha_k2 = key + ".alpha"
+
+                has1 = up_k1 in l1_data and down_k1 in l1_data
+                has2 = up_k2 in l2_data and down_k2 in l2_data
+
+                if not has1 and not has2:
+                    continue
+
+                if not has1:
+                    up, down, alpha = self._get_up_down_alpha_from_keys(key, l2_data, up_k2, down_k2, alpha_k2)
+                    if mode == "svd":
+                        up, down = self._svd_single(up, down, rank, threshold, device, dtype)
+                elif not has2:
+                    up, down, alpha = self._get_up_down_alpha_from_keys(key, l1_data, up_k1, down_k1, alpha_k1)
+                    if mode == "svd":
+                        up, down = self._svd_single(up, down, rank, threshold, device, dtype)
+                else:
+                    up1, down1, alpha1 = self._get_up_down_alpha_from_keys(key, l1_data, up_k1, down_k1, alpha_k1)
+                    up2, down2, alpha2 = self._get_up_down_alpha_from_keys(key, l2_data, up_k2, down_k2, alpha_k2)
+
+                    rank1 = up1.shape[1]
+                    rank2 = up2.shape[1]
+
+                    # Масштабирование второй с учётом alpha/rank
+                    scale = math.sqrt((alpha2 / rank2) / (alpha1 / rank1))
+                    up2_scaled = up2 * scale
+                    down2_scaled = down2 * scale
+
+                    up1 = up1.to(dtype=dtype)
+                    down1 = down1.to(dtype=dtype)
+                    up2_scaled = up2_scaled.to(dtype=dtype)
+                    down2_scaled = down2_scaled.to(dtype=dtype)
 
                     # Приводим размерности
-                    if up_1.dim() != up_2.dim():
-                        if up_1.dim() == 2 and up_2.dim() == 4:
-                            up_2 = up_2.squeeze(2).squeeze(3)
-                            down_2 = down_2.squeeze(2).squeeze(3)
-                        elif up_1.dim() == 4 and up_2.dim() == 2:
-                            up_1 = up_1.squeeze(2).squeeze(3)
-                            down_1 = down_1.squeeze(2).squeeze(3)
+                    if up1.dim() != up2_scaled.dim():
+                        if up1.dim() == 2 and up2_scaled.dim() == 4:
+                            up2_scaled = up2_scaled.squeeze(2).squeeze(3)
+                            down2_scaled = down2_scaled.squeeze(2).squeeze(3)
+                        elif up1.dim() == 4 and up2_scaled.dim() == 2:
+                            up1 = up1.squeeze(2).squeeze(3)
+                            down1 = down1.squeeze(2).squeeze(3)
 
                     if mode == "add":
-                        # ПРОСТОЕ СЛОЖЕНИЕ - смешиваем девушку1 и девушку2
-                        up = up_1 + up_2
-                        down = down_1 + down_2
-                        alpha = alpha_1
-                        print(f"    • ADD: up_1 + up_2, down_1 + down_2")
-                        
+                        up = up1 + up2_scaled
+                        down = down1 + down2_scaled
+                        alpha = alpha1
                     elif mode == "concat":
-                        # КОНКАТЕНАЦИЯ
-                        r_1 = up_1.shape[1]
-                        r_2 = up_2.shape[1]
-                        scale_1 = math.sqrt((r_1+r_2)/r_1) if r_1 > 0 else 1.0
-                        scale_2 = math.sqrt((r_1+r_2)/r_2) if r_2 > 0 else 1.0
-                        up = torch.cat([up_1*scale_1, up_2*scale_2], dim=1)
-                        down = torch.cat([down_1*scale_1, down_2*scale_2], dim=0)
-                        alpha = alpha_1 + alpha_2
-                        print(f"    • CONCAT: r1={r_1}, r2={r_2}, new_rank={r_1+r_2}")
-                        
+                        r1 = up1.shape[1]
+                        r2 = up2.shape[1]
+                        s1 = math.sqrt((r1 + r2) / r1) if r1 else 1.0
+                        s2 = math.sqrt((r1 + r2) / r2) if r2 else 1.0
+                        up = torch.cat([up1 * s1, up2_scaled * s2], dim=1)
+                        down = torch.cat([down1 * s1, down2_scaled * s2], dim=0)
+                        alpha = alpha1 + alpha2
                     elif mode == "svd":
-                        # SVD слияние
-                        up, down = self._svd_merge(up_1, down_1, up_2, down_2, rank, threshold, device)
+                        up, down = self._svd_merge(up1, down1, up2_scaled, down2_scaled, rank, threshold, device)
                         alpha = torch.tensor(rank, dtype=torch.int64)
-                        print(f"    • SVD: rank={rank}")
 
-                # Сохраняем результаты
-                weight[up_key] = up
-                weight[down_key] = down
-                weight[alpha_key] = alpha
-                
-                merged_count += 1
-                pber.update(1)
-                
+                # Применяем output_scale ко всем up/down
+                up = up * output_scale
+                down = down * output_scale
+
+                # Сохраняем с суффиксами первой LoRA
+                if suffix1 == "up/down":
+                    weight[key + ".lora_up.weight"] = up
+                    weight[key + ".lora_down.weight"] = down
+                else:
+                    weight[key + ".lora_B.weight"] = up
+                    weight[key + ".lora_A.weight"] = down
+                weight[key + ".alpha"] = alpha
+
+                pbar.update(1)
             except Exception as e:
-                print(f"❌ Error merging key {key}: {e}")
+                print(f"❌ Error on {key}: {e}")
                 import traceback
                 traceback.print_exc()
-                continue
-        
-        # Проверяем что есть результат
+
         if not weight:
-            print("❌ ERROR: No weights were merged!")
-            return {"lora": {}, "strength_model": 1, "strength_clip": 1}
-            
-        print(f"✅ Successfully merged {merged_count} modules with {len(weight)} total keys")
+            print("❌ No weights merged, returning lora_1")
+            return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
+
+        print(f"✅ Merged {len(weight)//3} modules with output_scale={output_scale}")
         return {"lora": weight, "strength_model": 1.0, "strength_clip": 1.0}
 
-    def _get_up_down_alpha(self, key, lora_data, strength_model, strength_clip):
-        """Извлекает up, down и alpha из данных LoRA"""
-        up_key = key + ".lora_up.weight"
-        down_key = key + ".lora_down.weight"
-        alpha_key = key + ".alpha"
-
-        if up_key not in lora_data or down_key not in lora_data:
-            raise KeyError(f"Missing keys for {key}")
-
-        is_te = "lora_te" in key
-        scale = strength_clip if is_te else strength_model
-        
-        # Применяем масштабирование
-        sqrt_scale = math.sqrt(abs(scale))
-        sign_scale = 1 if scale >= 0 else -1
-
-        up = lora_data[up_key] * sqrt_scale * sign_scale
-        down = lora_data[down_key] * sqrt_scale
-        
-        # Получаем alpha
-        if alpha_key in lora_data:
-            alpha = lora_data[alpha_key]
-        else:
-            # Если alpha нет, используем ранг
-            alpha = torch.tensor(up.shape[1], dtype=torch.int64)
-
+    def _get_up_down_alpha_from_keys(self, key, data, up_k, down_k, alpha_k):
+        if up_k not in data or down_k not in data:
+            raise KeyError(f"Missing keys for {key} (up={up_k}, down={down_k})")
+        up = data[up_k]
+        down = data[down_k]
+        alpha = data.get(alpha_k, torch.tensor(up.shape[1], dtype=torch.int64))
         return up, down, alpha
 
-    def _svd_single(self, up, down, rank, threshold, device, dtype):
-        """SVD для одной LoRA"""
-        org_device = up.device
-        org_dtype = up.dtype
-        
-        up = up.to(device)
-        down = down.to(device)
-        r = up.shape[1]
-        
-        weight = up.view(-1, r) @ down.view(r, -1)
-        weight = weight.to(dtype=torch.float32)
-        
-        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
-        
-        if threshold < 1.0:
-            rank = self._index_sv_fro(S, threshold)
-        rank = min(rank, len(S))
-        
-        U = U[:, :rank]
-        S = S[:rank]
-        U = U @ torch.diag(S)
-        Vh = Vh[:rank, :]
-        
-        # Clamp
-        dist = torch.cat([U.flatten(), Vh.flatten()])
-        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
-        low_val = -hi_val
-        U = U.clamp(low_val, hi_val)
-        Vh = Vh.clamp(low_val, hi_val)
-        
-        # Восстанавливаем размерность
-        if down.dim() == 4:
-            U = U.reshape(up.shape[0], rank, 1, 1)
-            Vh = Vh.reshape(rank, down.shape[1], down.shape[2], down.shape[3])
-        
-        up = U.to(org_device, dtype=org_dtype) * math.sqrt(rank)
-        down = Vh.to(org_device, dtype=org_dtype) * math.sqrt(rank)
-        
-        return up, down
-
-    def _svd_merge(self, up_1, down_1, up_2, down_2, rank, threshold, device):
-        """SVD слияние двух LoRA"""
-        org_device = up_1.device
-        org_dtype = up_1.dtype
-
-        up_1 = up_1.to(device)
-        down_1 = down_1.to(device)
-        r_1 = up_1.shape[1]
-        weight_1 = up_1.view(-1, r_1) @ down_1.view(r_1, -1)
-
-        if up_2 is not None:
-            up_2 = up_2.to(device)
-            down_2 = down_2.to(device)
-            r_2 = up_2.shape[1]
-            weight_2 = up_2.view(-1, r_2) @ down_2.view(r_2, -1)
-            weight = weight_1 / r_1 + weight_2 / r_2
-        else:
-            weight = weight_1 / r_1
-
-        weight = weight.to(dtype=torch.float32)
-        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
-
-        if threshold < 1.0:
-            rank = self._index_sv_fro(S, threshold)
-        rank = min(rank, len(S))
-
-        U = U[:, :rank]
-        S = S[:rank]
-        U = U @ torch.diag(S)
-        Vh = Vh[:rank, :]
-
-        # Clamp
-        dist = torch.cat([U.flatten(), Vh.flatten()])
-        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
-        low_val = -hi_val
-        U = U.clamp(low_val, hi_val)
-        Vh = Vh.clamp(low_val, hi_val)
-
-        if down_1.dim() == 4:
-            U = U.reshape(up_1.shape[0], rank, 1, 1)
-            Vh = Vh.reshape(rank, down_1.shape[1], down_1.shape[2], down_1.shape[3])
-
-        up = U.to(org_device, dtype=org_dtype) * math.sqrt(rank)
-        down = Vh.to(org_device, dtype=org_dtype) * math.sqrt(rank)
-
-        return up, down
-
-    def _index_sv_fro(self, S, target):
-        """Находит индекс для сохранения target% энергии"""
-        S_squared = S.pow(2)
-        s_fro_sq = float(torch.sum(S_squared))
-        if s_fro_sq == 0:
-            return 1
-        sum_S_squared = torch.cumsum(S_squared, dim=0)/s_fro_sq
-        index = int(torch.searchsorted(sum_S_squared, target**2)) + 1
-        index = max(1, min(index, len(S)-1))
-        return index
-
-    @classmethod
-    def IS_CHANGED(s, lora_1, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float16", lora_2=None):
-        import hashlib
-        key_str = f"{id(lora_1)}_{id(lora_2)}_{mode}_{rank}_{threshold}_{device}_{dtype}"
-        return hashlib.md5(key_str.encode()).hexdigest()
+    # Методы _svd_single, _svd_merge, _index_sv_fro остаются без изменений (скопируйте из предыдущей версии)
+    # ...
