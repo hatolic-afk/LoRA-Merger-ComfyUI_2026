@@ -12,7 +12,7 @@ class LoraMerger:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "lora_1": ("LoRA",),
+                "master_lora": ("LoRA",),
                 "mode": (["add", "concat", "svd"], ),
                 "rank": ("INT", {"default": 16, "min": 1, "max": 320, "step": 1}),
                 "threshold": ("FLOAT", {"default": 1.0, "min": 0, "max": 1, "step": 0.01}),
@@ -28,25 +28,25 @@ class LoraMerger:
     FUNCTION = "merge_loras"
     CATEGORY = "lora_merge"
 
-    def merge_loras(self, lora_1, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, lora_2=None):
+    def merge_loras(self, master_lora, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, lora_2=None):
         if lora_2 is None:
-            print("⚠️ No lora_2 provided, returning lora_1 as-is")
-            return (lora_1,)
+            print("⚠️ No lora_2 provided, returning master_lora as-is")
+            return (master_lora,)
         if not lora_2.get("lora", {}):
-            print("⚠️ lora_2 has no data, returning lora_1")
-            return (lora_1,)
-        result = self.merge(lora_1, lora_2, mode, rank, threshold, device, dtype, output_scale)
+            print("⚠️ lora_2 has no data, returning master_lora")
+            return (master_lora,)
+        result = self.merge(master_lora, lora_2, mode, rank, threshold, device, dtype, output_scale)
         return (result,)
 
     @torch.no_grad()
-    def merge(self, lora_1, lora_2, mode, rank, threshold, device, dtype, output_scale):
+    def merge(self, master_lora, lora_2, mode, rank, threshold, device, dtype, output_scale):
         weight = {}
         dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
         dtype = dtype_map.get(dtype, torch.float32)
         if device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
 
-        l1_data = lora_1.get("lora", {})
+        l1_data = master_lora.get("lora", {})
         l2_data = lora_2.get("lora", {})
 
         # --- Универсальное определение суффиксов ---
@@ -59,13 +59,12 @@ class LoraMerger:
 
         suffix1 = detect_suffix_type(l1_data)
         suffix2 = detect_suffix_type(l2_data)
-        print(f"🔍 Detected suffix types: LoRA1={suffix1}, LoRA2={suffix2}")
+        print(f"🔍 Detected suffix types: master_lora={suffix1}, lora_2={suffix2}")
 
         if suffix1 is None or suffix2 is None:
-            print("❌ Could not detect suffix type – using only lora_1")
+            print("❌ Could not detect suffix type – using only master_lora")
             return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
 
-        # Функция для получения базового ключа
         def get_base_key(key, suffix_type):
             if suffix_type == "up/down":
                 if ".lora_up" in key:
@@ -84,17 +83,17 @@ class LoraMerger:
         all_keys = list(set(keys_1 + keys_2))
 
         print(f"🔀 Merging {len(all_keys)} modules")
-        print(f"  keys_1: {len(keys_1)}, keys_2: {len(keys_2)}")
+        print(f"  master_lora keys: {len(keys_1)}, lora_2 keys: {len(keys_2)}")
 
         if not keys_2:
-            print("ℹ️ lora_2 has no base keys, using only lora_1")
+            print("ℹ️ lora_2 has no base keys, using only master_lora")
             return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
 
         pbar = comfy.utils.ProgressBar(len(all_keys))
 
         for key in all_keys:
             try:
-                # Формируем имена ключей
+                # Формируем имена ключей для master_lora
                 if suffix1 == "up/down":
                     up_k1 = key + ".lora_up.weight"
                     down_k1 = key + ".lora_down.weight"
@@ -104,6 +103,7 @@ class LoraMerger:
                     down_k1 = key + ".lora_A.weight"
                     alpha_k1 = key + ".alpha"
 
+                # Формируем имена ключей для lora_2
                 if suffix2 == "up/down":
                     up_k2 = key + ".lora_up.weight"
                     down_k2 = key + ".lora_down.weight"
@@ -134,7 +134,7 @@ class LoraMerger:
                     rank1 = up1.shape[1]
                     rank2 = up2.shape[1]
 
-                    # Масштабирование второй с учётом alpha/rank
+                    # Масштабируем вторую по alpha/rank
                     scale = math.sqrt((alpha2 / rank2) / (alpha1 / rank1))
                     up2_scaled = up2 * scale
                     down2_scaled = down2 * scale
@@ -153,27 +153,44 @@ class LoraMerger:
                             up1 = up1.squeeze(2).squeeze(3)
                             down1 = down1.squeeze(2).squeeze(3)
 
+                    # ============= ОСНОВНАЯ ЛОГИКА =============
                     if mode == "add":
+                        # Если ранги разные, дополняем нулями МЕНЬШИЙ ДО БОЛЬШЕГО
+                        if rank1 != rank2:
+                            if rank1 < rank2:
+                                # Дополняем up1 и down1
+                                pad_up = torch.zeros(up1.shape[0], rank2 - rank1, *up1.shape[2:], device=up1.device, dtype=up1.dtype)
+                                up1 = torch.cat([up1, pad_up], dim=1)
+                                pad_down = torch.zeros(rank2 - rank1, *down1.shape[1:], device=down1.device, dtype=down1.dtype)
+                                down1 = torch.cat([down1, pad_down], dim=0)
+                                print(f"  ℹ️ Padded master_lora rank {rank1}→{rank2}")
+                            else:
+                                # Дополняем up2 и down2
+                                pad_up = torch.zeros(up2_scaled.shape[0], rank1 - rank2, *up2_scaled.shape[2:], device=up2_scaled.device, dtype=up2_scaled.dtype)
+                                up2_scaled = torch.cat([up2_scaled, pad_up], dim=1)
+                                pad_down = torch.zeros(rank1 - rank2, *down2_scaled.shape[1:], device=down2_scaled.device, dtype=down2_scaled.dtype)
+                                down2_scaled = torch.cat([down2_scaled, pad_down], dim=0)
+                                print(f"  ℹ️ Padded lora_2 rank {rank2}→{rank1}")
+                        # Теперь ранги равны, складываем
                         up = up1 + up2_scaled
                         down = down1 + down2_scaled
                         alpha = alpha1
+
                     elif mode == "concat":
-                        r1 = up1.shape[1]
-                        r2 = up2.shape[1]
-                        s1 = math.sqrt((r1 + r2) / r1) if r1 else 1.0
-                        s2 = math.sqrt((r1 + r2) / r2) if r2 else 1.0
-                        up = torch.cat([up1 * s1, up2_scaled * s2], dim=1)
-                        down = torch.cat([down1 * s1, down2_scaled * s2], dim=0)
+                        # Конкатенация – просто объединяем
+                        up = torch.cat([up1, up2_scaled], dim=1)
+                        down = torch.cat([down1, down2_scaled], dim=0)
                         alpha = alpha1 + alpha2
+
                     elif mode == "svd":
                         up, down = self._svd_merge(up1, down1, up2_scaled, down2_scaled, rank, threshold, device)
                         alpha = torch.tensor(rank, dtype=torch.int64)
 
-                # Применяем output_scale ко всем up/down
+                # Применяем output_scale
                 up = up * output_scale
                 down = down * output_scale
 
-                # Сохраняем с суффиксами первой LoRA
+                # Сохраняем с суффиксами master_lora
                 if suffix1 == "up/down":
                     weight[key + ".lora_up.weight"] = up
                     weight[key + ".lora_down.weight"] = down
@@ -189,7 +206,7 @@ class LoraMerger:
                 traceback.print_exc()
 
         if not weight:
-            print("❌ No weights merged, returning lora_1")
+            print("❌ No weights merged, returning master_lora")
             return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
 
         print(f"✅ Merged {len(weight)//3} modules with output_scale={output_scale}")
@@ -203,5 +220,77 @@ class LoraMerger:
         alpha = data.get(alpha_k, torch.tensor(up.shape[1], dtype=torch.int64))
         return up, down, alpha
 
-    # Методы _svd_single, _svd_merge, _index_sv_fro остаются без изменений (скопируйте из предыдущей версии)
-    # ...
+    # ---------- SVD методы ----------
+    def _svd_single(self, up, down, rank, threshold, device, dtype):
+        org_device = up.device
+        org_dtype = up.dtype
+        up = up.to(device)
+        down = down.to(device)
+        r = up.shape[1]
+        weight = up.view(-1, r) @ down.view(r, -1)
+        weight = weight.to(torch.float32)
+        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
+        if threshold < 1.0:
+            rank = self._index_sv_fro(S, threshold)
+        rank = min(rank, len(S))
+        U = U[:, :rank]
+        S = S[:rank]
+        U = U @ torch.diag(S)
+        Vh = Vh[:rank, :]
+        dist = torch.cat([U.flatten(), Vh.flatten()])
+        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
+        low_val = -hi_val
+        U = U.clamp(low_val, hi_val)
+        Vh = Vh.clamp(low_val, hi_val)
+        if down.dim() == 4:
+            U = U.reshape(up.shape[0], rank, 1, 1)
+            Vh = Vh.reshape(rank, down.shape[1], down.shape[2], down.shape[3])
+        up = U.to(org_device, dtype=org_dtype) * math.sqrt(rank)
+        down = Vh.to(org_device, dtype=org_dtype) * math.sqrt(rank)
+        return up, down
+
+    def _svd_merge(self, up1, down1, up2, down2, rank, threshold, device):
+        org_device = up1.device
+        org_dtype = up1.dtype
+        up1 = up1.to(device)
+        down1 = down1.to(device)
+        up2 = up2.to(device)
+        down2 = down2.to(device)
+        r1 = up1.shape[1]
+        r2 = up2.shape[1]
+        weight = (up1.view(-1, r1) @ down1.view(r1, -1)) / r1 + (up2.view(-1, r2) @ down2.view(r2, -1)) / r2
+        weight = weight.to(torch.float32)
+        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
+        if threshold < 1.0:
+            rank = self._index_sv_fro(S, threshold)
+        rank = min(rank, len(S))
+        U = U[:, :rank]
+        S = S[:rank]
+        U = U @ torch.diag(S)
+        Vh = Vh[:rank, :]
+        dist = torch.cat([U.flatten(), Vh.flatten()])
+        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
+        low_val = -hi_val
+        U = U.clamp(low_val, hi_val)
+        Vh = Vh.clamp(low_val, hi_val)
+        if down1.dim() == 4:
+            U = U.reshape(up1.shape[0], rank, 1, 1)
+            Vh = Vh.reshape(rank, down1.shape[1], down1.shape[2], down1.shape[3])
+        up = U.to(org_device, dtype=org_dtype) * math.sqrt(rank)
+        down = Vh.to(org_device, dtype=org_dtype) * math.sqrt(rank)
+        return up, down
+
+    def _index_sv_fro(self, S, target):
+        S_squared = S.pow(2)
+        total = float(torch.sum(S_squared))
+        if total == 0:
+            return 1
+        cumsum = torch.cumsum(S_squared, dim=0) / total
+        idx = int(torch.searchsorted(cumsum, target**2)) + 1
+        idx = max(1, min(idx, len(S)-1))
+        return idx
+
+    @classmethod
+    def IS_CHANGED(s, master_lora, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, lora_2=None):
+        import hashlib
+        return hashlib.md5(f"{id(master_lora)}_{id(lora_2)}_{mode}_{rank}_{threshold}_{device}_{dtype}_{output_scale}".encode()).hexdigest()
