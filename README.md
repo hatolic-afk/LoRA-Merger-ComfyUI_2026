@@ -5,7 +5,7 @@
 ## Установка
 
 cd ComfyUI/custom_nodes/
-git clone https://github.com/your-repo/lora-merge-suite.git
+git clone https://github.com/your-repo/lora-merge-suite](https://github.com/hatolic-afk/LoRA-Merger-ComfyUI_2026.git
 
 ## Список нодов
 
