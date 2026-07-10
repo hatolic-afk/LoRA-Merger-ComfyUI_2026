@@ -2,7 +2,7 @@ import comfy
 import folder_paths
 import os
 import re
-import math  # <--- ДОБАВЛЯЕМ
+import math
 
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
 PRESET_FILE = os.path.join(CURRENT_DIR, "preset.txt")
@@ -94,7 +94,6 @@ class LoraLoaderWeightOnly:
         lora_path = folder_paths.get_full_path("loras", lora_name)
         lora = None
 
-        # Проверяем кеш
         if self.loaded_lora is not None:
             if self.loaded_lora[0] == lora_path:
                 lora = self.loaded_lora[1]
@@ -103,24 +102,20 @@ class LoraLoaderWeightOnly:
                 self.loaded_lora = None
                 del temp
 
-        # Загружаем LoRA если нужно
         if lora is None or self.lbw != lbw:
             try:
                 lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
                 print(f"📂 Loaded {lora_name}: {len(lora)} keys")
             except Exception as e:
                 print(f"❌ Error loading LoRA {lora_name}: {e}")
-                return ({"lora": {}, "strength_model": strength_model, "strength_clip": strength_clip}, )
+                return ({"lora": {}}, )
             
-            # Применяем LBW если указано
             if lbw != "":
                 weight_list = parse_weight_list(lbw)
                 if weight_list:
                     print(f"  • Applying LBW: {weight_list}")
                     weight_list = expand_lbw(weight_list)
                     length = len(weight_list)
-
-                    strength_clip = strength_clip * weight_list[0] if len(weight_list) > 0 else strength_clip
 
                     up_keys = [key for key in lora.keys() if "lora_up" in key and not "lora_te" in key]
                     keys_to_delete = []
@@ -163,7 +158,7 @@ class LoraLoaderWeightOnly:
                         if key in lora:
                             del lora[key]
             
-            # Теперь применяем масштабирование ко всем весам
+            # МАСШТАБИРУЕМ ВЕСА ЗДЕСЬ
             if strength_model != 1.0 or strength_clip != 1.0:
                 print(f"  • Scaling weights: model={strength_model}, clip={strength_clip}")
                 for key in list(lora.keys()):
@@ -174,17 +169,16 @@ class LoraLoaderWeightOnly:
                     if scale != 1.0:
                         sqrt_scale = math.sqrt(abs(scale))
                         sign_scale = 1 if scale >= 0 else -1
-                        if "lora_up" in key:
+                        if "lora_up" in key or "lora_B" in key:
                             lora[key] = lora[key] * sqrt_scale * sign_scale
-                        elif "lora_down" in key:
-                            lora[key] = lora[key] * sqrt_scale
-                        # alpha и другие ключи не масштабируем
+                        elif "lora_down" in key or "lora_A" in key:
+                            lora[key] = lora[key] * sqrt_scale * sign_scale
             
             self.loaded_lora = (lora_path, lora)
             self.lbw = lbw
 
-        # Возвращаем структуру LoRA с силой 1.0
-        return ({"lora": lora, "strength_model": 1.0, "strength_clip": 1.0}, )
+        # ВОЗВРАЩАЕМ ТОЛЬКО ВЕСА
+        return ({"lora": lora}, )
 
     @classmethod
     def IS_CHANGED(s, lora_name, strength_model, strength_clip, lbw):

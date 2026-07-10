@@ -13,7 +13,7 @@ class LoraMerger:
         return {
             "required": {
                 "master_lora": ("LoRA",),
-                "mode": (["add", "concat", "svd"], ),
+                "mode": (["add", "concat", "svd", "weighted_avg", "weighted_sum", "interpolate", "magnitude", "difference"], ),
                 "rank": ("INT", {"default": 16, "min": 1, "max": 320, "step": 1}),
                 "threshold": ("FLOAT", {"default": 1.0, "min": 0, "max": 1, "step": 0.01}),
                 "device": (["cuda", "cpu"], ),
@@ -49,7 +49,6 @@ class LoraMerger:
         l1_data = master_lora.get("lora", {})
         l2_data = lora_2.get("lora", {})
 
-        # --- Универсальное определение суффиксов ---
         def detect_suffix_type(data):
             if any(".lora_up" in k or ".lora_down" in k for k in data):
                 return "up/down"
@@ -63,7 +62,7 @@ class LoraMerger:
 
         if suffix1 is None or suffix2 is None:
             print("❌ Could not detect suffix type – using only master_lora")
-            return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
+            return {"lora": l1_data}
 
         def get_base_key(key, suffix_type):
             if suffix_type == "up/down":
@@ -82,18 +81,17 @@ class LoraMerger:
         keys_2 = list({get_base_key(k, suffix2) for k in l2_data.keys() if get_base_key(k, suffix2)})
         all_keys = list(set(keys_1 + keys_2))
 
-        print(f"🔀 Merging {len(all_keys)} modules")
+        print(f"🔀 Merging {len(all_keys)} modules using mode: {mode}")
         print(f"  master_lora keys: {len(keys_1)}, lora_2 keys: {len(keys_2)}")
 
         if not keys_2:
             print("ℹ️ lora_2 has no base keys, using only master_lora")
-            return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
+            return {"lora": l1_data}
 
         pbar = comfy.utils.ProgressBar(len(all_keys))
 
         for key in all_keys:
             try:
-                # Формируем имена ключей для master_lora
                 if suffix1 == "up/down":
                     up_k1 = key + ".lora_up.weight"
                     down_k1 = key + ".lora_down.weight"
@@ -103,7 +101,6 @@ class LoraMerger:
                     down_k1 = key + ".lora_A.weight"
                     alpha_k1 = key + ".alpha"
 
-                # Формируем имена ключей для lora_2
                 if suffix2 == "up/down":
                     up_k2 = key + ".lora_up.weight"
                     down_k2 = key + ".lora_down.weight"
@@ -134,63 +131,111 @@ class LoraMerger:
                     rank1 = up1.shape[1]
                     rank2 = up2.shape[1]
 
-                    # Масштабируем вторую по alpha/rank
-                    scale = math.sqrt((alpha2 / rank2) / (alpha1 / rank1))
-                    up2_scaled = up2 * scale
-                    down2_scaled = down2 * scale
-
-                    up1 = up1.to(dtype=dtype)
-                    down1 = down1.to(dtype=dtype)
-                    up2_scaled = up2_scaled.to(dtype=dtype)
-                    down2_scaled = down2_scaled.to(dtype=dtype)
-
-                    # Приводим размерности
-                    if up1.dim() != up2_scaled.dim():
-                        if up1.dim() == 2 and up2_scaled.dim() == 4:
-                            up2_scaled = up2_scaled.squeeze(2).squeeze(3)
-                            down2_scaled = down2_scaled.squeeze(2).squeeze(3)
-                        elif up1.dim() == 4 and up2_scaled.dim() == 2:
+                    if up1.dim() != up2.dim():
+                        if up1.dim() == 2 and up2.dim() == 4:
+                            up2 = up2.squeeze(2).squeeze(3)
+                            down2 = down2.squeeze(2).squeeze(3)
+                        elif up1.dim() == 4 and up2.dim() == 2:
                             up1 = up1.squeeze(2).squeeze(3)
                             down1 = down1.squeeze(2).squeeze(3)
 
+                    up1 = up1.to(dtype=dtype)
+                    down1 = down1.to(dtype=dtype)
+                    up2 = up2.to(dtype=dtype)
+                    down2 = down2.to(dtype=dtype)
+
                     # ============= ОСНОВНАЯ ЛОГИКА =============
                     if mode == "add":
-                        # Если ранги разные, дополняем нулями МЕНЬШИЙ ДО БОЛЬШЕГО
-                        if rank1 != rank2:
-                            if rank1 < rank2:
-                                # Дополняем up1 и down1
-                                pad_up = torch.zeros(up1.shape[0], rank2 - rank1, *up1.shape[2:], device=up1.device, dtype=up1.dtype)
-                                up1 = torch.cat([up1, pad_up], dim=1)
-                                pad_down = torch.zeros(rank2 - rank1, *down1.shape[1:], device=down1.device, dtype=down1.dtype)
-                                down1 = torch.cat([down1, pad_down], dim=0)
-                                print(f"  ℹ️ Padded master_lora rank {rank1}→{rank2}")
-                            else:
-                                # Дополняем up2 и down2
-                                pad_up = torch.zeros(up2_scaled.shape[0], rank1 - rank2, *up2_scaled.shape[2:], device=up2_scaled.device, dtype=up2_scaled.dtype)
-                                up2_scaled = torch.cat([up2_scaled, pad_up], dim=1)
-                                pad_down = torch.zeros(rank1 - rank2, *down2_scaled.shape[1:], device=down2_scaled.device, dtype=down2_scaled.dtype)
-                                down2_scaled = torch.cat([down2_scaled, pad_down], dim=0)
-                                print(f"  ℹ️ Padded lora_2 rank {rank2}→{rank1}")
-                        # Теперь ранги равны, складываем
-                        up = up1 + up2_scaled
-                        down = down1 + down2_scaled
+                        # Просто складываем (веса уже масштабированы)
+                        up = up1 + up2
+                        down = down1 + down2
+                        alpha = alpha1
+                        
+                        # Легкая нормализация
+                        up_norm = torch.norm(up)
+                        if up_norm > 10.0:
+                            up = up / (up_norm / 5.0)
+                        down_norm = torch.norm(down)
+                        if down_norm > 10.0:
+                            down = down / (down_norm / 5.0)
+
+                    elif mode == "weighted_avg":
+                        # Простое усреднение 50/50
+                        up = (up1 + up2) / 2
+                        down = (down1 + down2) / 2
+                        alpha = (alpha1 + alpha2) / 2
+
+                    elif mode == "weighted_sum":
+                        # Сумма с нормализацией
+                        up = up1 + up2
+                        down = down1 + down2
+                        alpha = (alpha1 + alpha2) / 2
+                        
+                        up_norm = torch.norm(up)
+                        down_norm = torch.norm(down)
+                        if up_norm > 1.0:
+                            up = up / up_norm
+                        if down_norm > 1.0:
+                            down = down / down_norm
+
+                    elif mode == "interpolate":
+                        # Интерполяция 50/50
+                        t = 0.5
+                        theta = t * torch.pi / 2
+                        up = up1 * torch.cos(theta) + up2 * torch.sin(theta)
+                        down = down1 * torch.cos(theta) + down2 * torch.sin(theta)
+                        alpha = (alpha1 + alpha2) / 2
+                        
+                        up_norm = torch.norm(up)
+                        if up_norm > 0:
+                            up = up / up_norm * torch.norm(up1)
+                        down_norm = torch.norm(down)
+                        if down_norm > 0:
+                            down = down / down_norm * torch.norm(down1)
+
+                    elif mode == "magnitude":
+                        # Берем максимальные по модулю
+                        up_abs1 = torch.abs(up1)
+                        up_abs2 = torch.abs(up2)
+                        up = torch.where(up_abs1 > up_abs2, up1, up2)
+                        
+                        down_abs1 = torch.abs(down1)
+                        down_abs2 = torch.abs(down2)
+                        down = torch.where(down_abs1 > down_abs2, down1, down2)
+                        
+                        alpha = alpha1 if alpha1 > alpha2 else alpha2
+
+                    elif mode == "difference":
+                        # Добавляем только значимые различия
+                        diff_up = up2 - up1
+                        diff_down = down2 - down1
+                        
+                        threshold_diff = 0.1
+                        mask_up = torch.abs(diff_up) > threshold_diff
+                        mask_down = torch.abs(diff_down) > threshold_diff
+                        
+                        up = up1 + diff_up * mask_up.float()
+                        down = down1 + diff_down * mask_down.float()
                         alpha = alpha1
 
                     elif mode == "concat":
-                        # Конкатенация – просто объединяем
-                        up = torch.cat([up1, up2_scaled], dim=1)
-                        down = torch.cat([down1, down2_scaled], dim=0)
+                        # Конкатенация
+                        up = torch.cat([up1, up2], dim=1)
+                        down = torch.cat([down1, down2], dim=0)
                         alpha = alpha1 + alpha2
 
                     elif mode == "svd":
-                        up, down = self._svd_merge(up1, down1, up2_scaled, down2_scaled, rank, threshold, device)
+                        up, down = self._svd_merge(up1, down1, up2, down2, rank, threshold, device)
                         alpha = torch.tensor(rank, dtype=torch.int64)
 
                 # Применяем output_scale
                 up = up * output_scale
                 down = down * output_scale
+                
+                # Безопасный clamp
+                up = torch.clamp(up, -5.0, 5.0)
+                down = torch.clamp(down, -5.0, 5.0)
 
-                # Сохраняем с суффиксами master_lora
                 if suffix1 == "up/down":
                     weight[key + ".lora_up.weight"] = up
                     weight[key + ".lora_down.weight"] = down
@@ -207,10 +252,10 @@ class LoraMerger:
 
         if not weight:
             print("❌ No weights merged, returning master_lora")
-            return {"lora": l1_data, "strength_model": 1.0, "strength_clip": 1.0}
+            return {"lora": l1_data}
 
         print(f"✅ Merged {len(weight)//3} modules with output_scale={output_scale}")
-        return {"lora": weight, "strength_model": 1.0, "strength_clip": 1.0}
+        return {"lora": weight}
 
     def _get_up_down_alpha_from_keys(self, key, data, up_k, down_k, alpha_k):
         if up_k not in data or down_k not in data:
@@ -220,7 +265,6 @@ class LoraMerger:
         alpha = data.get(alpha_k, torch.tensor(up.shape[1], dtype=torch.int64))
         return up, down, alpha
 
-    # ---------- SVD методы ----------
     def _svd_single(self, up, down, rank, threshold, device, dtype):
         org_device = up.device
         org_dtype = up.dtype
@@ -237,16 +281,13 @@ class LoraMerger:
         S = S[:rank]
         U = U @ torch.diag(S)
         Vh = Vh[:rank, :]
-        dist = torch.cat([U.flatten(), Vh.flatten()])
-        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
-        low_val = -hi_val
-        U = U.clamp(low_val, hi_val)
-        Vh = Vh.clamp(low_val, hi_val)
+        U = torch.clamp(U, -1.0, 1.0)
+        Vh = torch.clamp(Vh, -1.0, 1.0)
         if down.dim() == 4:
             U = U.reshape(up.shape[0], rank, 1, 1)
             Vh = Vh.reshape(rank, down.shape[1], down.shape[2], down.shape[3])
-        up = U.to(org_device, dtype=org_dtype) * math.sqrt(rank)
-        down = Vh.to(org_device, dtype=org_dtype) * math.sqrt(rank)
+        up = U.to(org_device, dtype=org_dtype)
+        down = Vh.to(org_device, dtype=org_dtype)
         return up, down
 
     def _svd_merge(self, up1, down1, up2, down2, rank, threshold, device):
@@ -268,16 +309,13 @@ class LoraMerger:
         S = S[:rank]
         U = U @ torch.diag(S)
         Vh = Vh[:rank, :]
-        dist = torch.cat([U.flatten(), Vh.flatten()])
-        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
-        low_val = -hi_val
-        U = U.clamp(low_val, hi_val)
-        Vh = Vh.clamp(low_val, hi_val)
+        U = torch.clamp(U, -1.0, 1.0)
+        Vh = torch.clamp(Vh, -1.0, 1.0)
         if down1.dim() == 4:
             U = U.reshape(up1.shape[0], rank, 1, 1)
             Vh = Vh.reshape(rank, down1.shape[1], down1.shape[2], down1.shape[3])
-        up = U.to(org_device, dtype=org_dtype) * math.sqrt(rank)
-        down = Vh.to(org_device, dtype=org_dtype) * math.sqrt(rank)
+        up = U.to(org_device, dtype=org_dtype)
+        down = Vh.to(org_device, dtype=org_dtype)
         return up, down
 
     def _index_sv_fro(self, S, target):

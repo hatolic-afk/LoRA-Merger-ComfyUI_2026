@@ -6,8 +6,8 @@ class LoraMergerStack:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "master_lora": ("LoRA",),  # <-- ПЕРЕИМЕНОВАНО
-                "mode": (["add", "concat", "svd"], {"default": "add"}),
+                "master_lora": ("LoRA",),
+                "mode": (["add", "concat", "svd", "weighted_avg", "weighted_sum", "interpolate", "magnitude", "difference"], {"default": "add"}),
                 "rank": ("INT", {"default": 16, "min": 1, "max": 320, "step": 1}),
                 "threshold": ("FLOAT", {"default": 1.0, "min": 0, "max": 1, "step": 0.01}),
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
@@ -44,12 +44,13 @@ class LoraMergerStack:
 
         merged = loras[0]
         merger = LoraMerger()
+        
         for i, lora in enumerate(loras[1:], start=2):
             print(f"🔄 Merging step {i-1}: step_{i-1} + lora_{i}")
             merged = merger.merge_loras(merged, mode, rank, threshold, device, dtype, output_scale, lora)
             merged = merged[0]
 
-        print(f"✅ Merged {len(loras)} LoRAs into one")
+        print(f"✅ Merged {len(loras)} LoRAs into one using mode: {mode}")
         return (merged,)
 
     @classmethod

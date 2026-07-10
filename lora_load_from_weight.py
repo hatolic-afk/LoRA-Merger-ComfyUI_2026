@@ -15,26 +15,17 @@ class LoraLoaderFromWeight:
     CATEGORY = "lora_merge"
 
     def load_lora_from_weight(self, model, clip, lora):
-        # Извлекаем данные из структуры LoRA
         lora_weight = lora.get("lora", {})
-        strength_model = lora.get("strength_model", 1.0)
-        strength_clip = lora.get("strength_clip", 1.0)
-
-        # Проверяем, нужно ли применять LoRA
-        if strength_model == 0 and strength_clip == 0:
-            print("ℹ️ Both strengths are 0, skipping LoRA")
-            return (model, clip)
-
-        # Проверяем, что у нас есть данные LoRA
+        
         if not lora_weight:
             print("⚠️ Warning: Empty LoRA data")
             return (model, clip)
 
         try:
-            print(f"🔄 Applying LoRA with model={strength_model}, clip={strength_clip}")
-            # Применяем LoRA к модели и CLIP
+            print(f"🔄 Applying LoRA (weights already scaled)")
+            # Веса уже масштабированы в LoraLoaderWeightOnly
             model_lora, clip_lora = comfy.sd.load_lora_for_models(
-                model, clip, lora_weight, strength_model, strength_clip
+                model, clip, lora_weight, 1.0, 1.0
             )
             print("✅ LoRA applied successfully")
             return (model_lora, clip_lora)
