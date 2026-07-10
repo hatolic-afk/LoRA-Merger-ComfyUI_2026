@@ -1,84 +1,167 @@
-# LoRA Merger ComfyUI
-このプロジェクトはこちらへ移動しました。
-https://github.com/laksjdjf/cgem156-ComfyUI/tree/main/scripts/lora_merger
+# LoRA Merge Suite для ComfyUI
 
-このリポジトリはComfyUI上でLoRAのマージを実装したものです。
-![image](https://github.com/laksjdjf/LoRA-Merger-ComfyUI/assets/22386664/37081875-0572-477c-be3b-c128b3e31859)
+Набор нодов для загрузки, мержа и сохранения LoRA весов с поддержкой 8 методов объединения.
 
+## Установка
 
+cd ComfyUI/custom_nodes/
+git clone https://github.com/your-repo/lora-merge-suite.git
 
-## ノード
-全てのノードはlora_mergeに入っています。
+## Список нодов
 
-1. `Load LoRA Weight Only`: LoRAを単体で読み込みます。
-2. `LoRA LoRA from Weight`: LoRAをモデルに適用します。
-3. `Merge LoRA`: 二つのLoRAをマージします。
-4. `Save LoRA`: LoRAを`ComfyUI/models/loras`にセーブします。**※設定したstrengthを適用したLoRAが保存されます。**
+### 1. LoraLoaderWeightOnly
+Загружает LoRA из файла, применяет LBW и масштабирует веса.
 
-## マージについて
-4つ設定があります。`dtype`はLoRAの型になります。ファイルサイズを軽くしたいときは`float16`や`bfloat16`にしてください。
-`rank`, `device`は`mode`を`svd`にしたときのみ参照されます。
+Входные параметры:
+- lora_name (STRING) - Имя файла LoRA из папки loras
+- strength_model (FLOAT, default: 1.0) - Сила применения к модели (-20.0 до 20.0)
+- strength_clip (FLOAT, default: 1.0) - Сила применения к CLIP (-20.0 до 20.0)
+- lbw (STRING, default: "") - Блочные веса для тонкой настройки
 
-`mode`の説明:
-1. `add`:加算によってマージします。二つのLoRAのrankがイコールではない場合、エラーが起きます。また二つのLoRAが全く違うものである場合精度は低くなります。
-2. `concat`:結合によってマージします。rankは二つのLoRAの合計になってしまいますが、正確なマージになります。
-3. `svd`:特異値分解を利用してマージします。rankを設定することで、自由にマージ先のrankを変えることができます。ただし時間がかかるほか、精度も少し落ちます。`device`でGPUで計算するかCPUで計算するか選べます。
+Выход:
+- LoRA - Загруженные и масштабированные веса
 
-## ブロック別重みについて
-`LoRA LoRA from Weight`のlbw欄に、[sd-webui-lora-block-weight](https://github.com/hako-mikan/sd-webui-lora-block-weight)に沿った文字列を記入するといい感じになります。プリセットはpreset.txtで追加できます。RとかUには未対応です。
+### 2. LoraMerger
+Объединяет две LoRA в одну.
 
-## 注意点
-+ メタデータのことはよく分からないので何も考慮してません。
-+ LyCORISのLoHAやLokrには未対応です。というかこれらはマージできるのか？
-+ 異なる学習コードで作成されたLoRA同士のマージはうまくいかない可能性があります。
+Входные параметры:
+- master_lora (LoRA) - Основная LoRA
+- lora_2 (LoRA, optional) - Вторая LoRA
+- mode (STRING, default: "add") - Метод мержа: add, concat, svd, weighted_avg, weighted_sum, interpolate, magnitude, difference
+- rank (INT, default: 16) - Ранг для SVD (1-320)
+- threshold (FLOAT, default: 1.0) - Порог для SVD (0-1)
+- device (STRING, default: "cuda") - Устройство: cuda/cpu
+- dtype (STRING, default: "float32") - Тип данных: float32/float16/bfloat16
+- output_scale (FLOAT, default: 1.0) - Масштаб результата (0.0-2.0)
 
-## 数学的な話
-二つのLoRAのup層、down層、alpha、rank、strengthをそれぞれ、 $A_i, B_i, \alpha_i, r_i, w_i (i = 1,2)$ とします。
+Выход:
+- LoRA - Объединенная LoRA
 
-すると、欲しいLoRAは、以下の通りです。
+### 3. LoraMergerStack
+Объединяет до 10 LoRA последовательно.
 
-$\displaystyle{\frac{\alpha}{r}}AB =  w_1\displaystyle{\frac{\alpha_1}{r_1}}A_1B_1 + w_2\displaystyle{\frac{\alpha_2}{r_2}}A_2B_2 $
+Входные параметры:
+- master_lora (LoRA) - Основная LoRA
+- lora_2 до lora_10 (LoRA, optional) - Дополнительные LoRA
+- mode (STRING, default: "add") - Метод мержа
+- rank (INT, default: 16) - Ранг для SVD
+- threshold (FLOAT, default: 1.0) - Порог для SVD
+- device (STRING, default: "cuda") - Устройство
+- dtype (STRING, default: "float32") - Тип данных
+- output_scale (FLOAT, default: 1.0) - Масштаб результата
 
-1.どちらか一方のLoRAにしかないモジュールについて
+Выход:
+- LoRA - Объединенная LoRA
 
-片方しかない場合、ある方 $i$ のLoRAを使って、
+### 4. LoraLoaderFromWeight
+Применяет LoRA к модели и CLIP.
 
-$A = \sqrt{w_i}A_i,\ \ B =  \sqrt{w_i}B_i,\ \ \alpha = \alpha_i$
+Входные параметры:
+- model (MODEL) - Модель для применения
+- clip (CLIP) - CLIP для применения
+- lora (LoRA) - LoRA веса
 
-とします。行列積をとることを考えて、 $w_i$ の二乗根をとります。どちらか一方にだけそのままかけるという方法でもいいと思いますが、計算精度の問題でどちらがいいのかわからないのでとりあえずこっちにしてます。
+Выход:
+- MODEL - Модель с примененной LoRA
+- CLIP - CLIP с примененной LoRA
 
-2. 両方ある場合
+### 5. LoraSaveToFile
+Сохраняет LoRA в файл.
 
-モードによって異なります。
+Входные параметры:
+- lora (LoRA) - LoRA для сохранения
+- file_name (STRING, default: "merged") - Имя файла без расширения
+- extension (STRING, default: "safetensors") - Расширение файла
 
-`add`:
-down層、up層をそれぞれ重み付き加算することによってマージします。
+Выход: Нет (OUTPUT_NODE)
 
- $A = w_1A_1 + \displaystyle{\sqrt{\frac{\alpha_2}{\alpha _1}}}w_2A_2,\ \ B = w_1B_1 + \displaystyle{\sqrt{\frac{\alpha_2}{\alpha _1}}}w_2B_2,\ \ \alpha = \alpha_1,\ \ r=r_1=r_2$
+## Методы мержа (mode)
 
- とします。
+ADD - Простое сложение весов. Стандартный метод, объединение двух стилей.
+WEIGHTED_AVG - Усреднение 50/50. Когда нужна золотая середина.
+WEIGHTED_SUM - Сумма с нормализацией. Когда веса слишком большие.
+INTERPOLATE - Сферическая интерполяция. Плавный переход между стилями.
+MAGNITUDE - Выбор максимальных значений. Выделение доминирующего стиля.
+DIFFERENCE - Добавление только различий. Дополнение существующего стиля.
+CONCAT - Конкатенация рангов. Сохранение всей информации.
+SVD - Сингулярное разложение. Сжатие и удаление шума.
 
-$\displaystyle{\frac{\alpha}{r}}AB = {w_1}^2\displaystyle{\frac{\alpha_1}{r}}A_1B_1  + w_1w_2\displaystyle{\frac{\sqrt{\alpha_1\alpha_2}}{r}}A_1B_2 + w_1w_2\displaystyle{\frac{\sqrt{\alpha_1\alpha_2}}{r}}A_2B_1 + {w_2}^2\displaystyle{\frac{\alpha_2}{r}}A_2B_2$ 
+## Сравнение методов
 
- となります。正直意味わからないんですが、同じLoRAを $w_1+w_2=1$ でマージしたときに同じLoRAになるよう調整されています。
+ADD: Сохраняет всю информацию, артефакты могут быть, скорость быстрая, сложность простая
+WEIGHTED_AVG: Сохраняет среднюю информацию, артефактов минимум, скорость быстрая, сложность простая
+WEIGHTED_SUM: Сохраняет всю информацию, артефактов минимум, скорость быстрая, сложность средняя
+INTERPOLATE: Сохраняет всю информацию, артефактов нет, скорость средняя, сложность высокая
+MAGNITUDE: Сохраняет сильную информацию, артефакты могут быть, скорость быстрая, сложность простая
+DIFFERENCE: Сохраняет новую информацию, артефактов нет, скорость быстрая, сложность средняя
+CONCAT: Сохраняет всю информацию, артефактов нет, скорость средняя, сложность средняя
+SVD: Сохраняет сжатую информацию, артефактов минимум, скорость медленная, сложность очень высокая
 
- `concat`:
-down層、up層をそれぞれrank方向に結合することによってマージします。
+## Схема работы
 
-$A = (\sqrt{w_1}\displaystyle{\sqrt{\frac{r_1+r_2}{r_1}}}A_1\ \ \displaystyle{\sqrt{w_2\frac{\alpha_2}{\alpha_1}}}\displaystyle{\sqrt{\frac{r_1+r_2}{r_2}}}A_2),\ \ B = (\sqrt{w_1}\displaystyle{\sqrt{\frac{r_1+r_2}{r_1}}}B_1\ \ \displaystyle{\sqrt{w_2\frac{\alpha_2}{\alpha_1}}}\displaystyle{\sqrt{\frac{r_1+r_2}{r_2}}}B_2)^T,\ \ \alpha=\alpha_1,\ \ r=r_1+r_2$
+LoraLoaderWeightOnly -> загружает safetensors -> применяет LBW -> масштабирует по strength -> возвращает ТОЛЬКО ВЕСА
 
-とします。
+LoraMerger -> берет две LoRA -> мержит по методу -> возвращает ТОЛЬКО ВЕСА
 
-$\displaystyle{\frac{\alpha}{r}}AB =  w_1\displaystyle{\frac{\alpha_1}{r_1}}A_1B_1 + w_2\displaystyle{\frac{\alpha_2}{r_2}}A_2B_2 $
-となり完全なマージになります。
+LoraMergerStack -> берет до 10 LoRA -> мержит последовательно -> возвращает ТОЛЬКО ВЕСА
 
-$w < 0$ のときはそのままでは二乗根を計算できないので、絶対値をとって、 $A$ 側に後からマイナスをかけることにしています。
+LoraLoaderFromWeight -> берет LoRA -> применяет к модели с силой 1.0 (веса уже масштабированы)
 
-`svd`
+LoraSaveToFile -> берет LoRA -> сохраняет как safetensors
 
- $W = \displaystyle{\frac{r}{r_1}}\sqrt{w_1}A_1\sqrt{w_1}B_1 + \displaystyle{\frac{r}{r_2}}\displaystyle{\sqrt{w_2\frac{\alpha_2}{\alpha_1}}}A_2\displaystyle{\sqrt{w_2\frac{\alpha_2}{\alpha_1}}}B_2$
+## Примеры использования
 
- として $W$ を特異値分解による低ランク近似で二つの $r=$ `rank`の行列 $A,B$ に分解します。
+Пример 1: Простой мерж двух лор
+LoraLoaderWeightOnly (lora1.safetensors, strength=0.8) -> LoRA1
+LoraLoaderWeightOnly (lora2.safetensors, strength=0.6) -> LoRA2
+LoraMerger (master=LoRA1, lora_2=LoRA2, mode="add") -> Merged
+LoraLoaderFromWeight (model, clip, Merged) -> (model, clip)
 
- 
+Пример 2: Мерж с усреднением
+LoraLoaderWeightOnly (style.safetensors, strength=1.0) -> LoRA1
+LoraLoaderWeightOnly (detail.safetensors, strength=1.0) -> LoRA2
+LoraMerger (master=LoRA1, lora_2=LoRA2, mode="weighted_avg") -> Merged
+LoraLoaderFromWeight (model, clip, Merged) -> (model, clip)
 
+Пример 3: Стек из 5 лор
+LoraLoaderWeightOnly (lora1.safetensors, strength=0.7) -> L1
+LoraLoaderWeightOnly (lora2.safetensors, strength=0.5) -> L2
+LoraLoaderWeightOnly (lora3.safetensors, strength=0.8) -> L3
+LoraLoaderWeightOnly (lora4.safetensors, strength=0.6) -> L4
+LoraLoaderWeightOnly (lora5.safetensors, strength=0.4) -> L5
+LoraMergerStack (master_lora=L1, lora_2=L2, lora_3=L3, lora_4=L4, lora_5=L5, mode="add") -> Merged
+LoraLoaderFromWeight (model, clip, Merged) -> (model, clip)
+
+Пример 4: Сохранение результата
+LoraLoaderWeightOnly (lora1.safetensors, strength=0.8) -> L1
+LoraLoaderWeightOnly (lora2.safetensors, strength=0.6) -> L2
+LoraMerger (master=L1, lora_2=L2, mode="add") -> Merged
+LoraSaveToFile (lora=Merged, file_name="my_merged_lora") -> сохраняет my_merged_lora.safetensors
+
+## LBW (Layer Block Weights)
+
+Позволяет задавать разные веса для разных блоков модели.
+
+Формат: block1, block2, block3, ...
+
+Примеры:
+1.0, 0.8, 0.6, 0.4, 0.2 - убывающие веса
+0.0, 1.0, 0.0, 1.0, 0.0 - выборочные блоки
+
+Можно использовать пресеты из файла preset.txt
+
+## Важные моменты
+
+1. Все веса масштабируются в LoraLoaderWeightOnly через strength_model и strength_clip
+2. LoraLoaderFromWeight применяет LoRA с силой 1.0 (веса уже масштабированы)
+3. LoraMerger работает с уже масштабированными весами - не нужно дополнительных параметров
+4. Формат LoRA везде одинаковый: {"lora": {weights}} - без лишних метаданных
+5. Поддерживаются два формата: lora_up/lora_down и lora_A/lora_B
+
+## Лицензия
+
+MIT
+
+## Вклад
+
+PR и Issue приветствуются!
