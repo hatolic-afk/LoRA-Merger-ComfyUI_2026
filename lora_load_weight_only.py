@@ -16,20 +16,26 @@ def expand_lbw(weight_list):
         new_list = []
         j = 0
         for i in range(26):
-            if i in LBW17TO26:
+            if i in [2, 5, 8, 11, 12, 13, 15, 16, 17]:
                 new_list.append(0.0)
             else:
-                new_list.append(weight_list[j])
-                j += 1
+                if j < len(weight_list):
+                    new_list.append(weight_list[j])
+                    j += 1
+                else:
+                    new_list.append(0.0)
     elif length == 12:
         new_list = []
         j = 0
         for i in range(20):
-            if i in LBW12TO20:
+            if i in [2, 3, 4, 5, 8, 18, 19, 20]:
                 new_list.append(0.0)
             else:
-                new_list.append(weight_list[j])
-                j += 1
+                if j < len(weight_list):
+                    new_list.append(weight_list[j])
+                    j += 1
+                else:
+                    new_list.append(0.0)
     else:
         new_list = weight_list
     return new_list
@@ -64,9 +70,7 @@ def parse_weight_list(text):
         else:
             return []
 
-LBW17TO26 = [2, 5, 8, 11, 12, 13, 15, 16, 17]
-LBW12TO20 = [2, 3, 4, 5, 8, 18, 19, 20]
-MID_ID = {26:13, 20:10}
+MID_ID = {26: 13, 20: 10}
 
 class LoraLoaderWeightOnly:
     def __init__(self):
@@ -86,6 +90,7 @@ class LoraLoaderWeightOnly:
                 }),
             }
         }
+
     RETURN_TYPES = ("LoRA", )
     FUNCTION = "load_lora_weight_only"
     CATEGORY = "lora_merge"
@@ -93,7 +98,7 @@ class LoraLoaderWeightOnly:
     def load_lora_weight_only(self, lora_name, strength_model, strength_clip, lbw):
         lora_path = folder_paths.get_full_path("loras", lora_name)
         lora = None
-
+        
         if self.loaded_lora is not None:
             if self.loaded_lora[0] == lora_path:
                 lora = self.loaded_lora[1]
@@ -109,19 +114,25 @@ class LoraLoaderWeightOnly:
             except Exception as e:
                 print(f"❌ Error loading LoRA {lora_name}: {e}")
                 return ({"lora": {}}, )
-            
+
             if lbw != "":
                 weight_list = parse_weight_list(lbw)
                 if weight_list:
                     print(f"  • Applying LBW: {weight_list}")
                     weight_list = expand_lbw(weight_list)
                     length = len(weight_list)
-
-                    up_keys = [key for key in lora.keys() if "lora_up" in key and not "lora_te" in key]
-                    keys_to_delete = []
                     
+                    # Определяем тип LoRA
+                    up_keys = [key for key in lora.keys() if "lora_up" in key and not "lora_te" in key]
+                    if not up_keys:
+                        up_keys = [key for key in lora.keys() if "lora_B" in key and not "lora_te" in key]
+                    
+                    # Группируем ключи по блокам
+                    block_keys = {}
                     for key in up_keys:
                         ids = extract_numbers(key)
+                        block_id = 0
+                        
                         if "input_blocks" in key:
                             block_id = ids[0] if ids else 0
                         elif "middle_block" in key:
@@ -129,55 +140,90 @@ class LoraLoaderWeightOnly:
                         elif "output_blocks" in key:
                             block_id = ids[0] + MID_ID.get(length, 13) + 1 if ids else 0
                         elif "down_blocks" in key:
-                            block_id = ids[0]*3 + ids[1] + 1 if len(ids) >= 2 else 0
+                            if len(ids) >= 2:
+                                block_id = ids[0]*3 + ids[1] + 1
+                            else:
+                                block_id = 0
                             if "down_sampler" in key:
                                 block_id += 2
                         elif "mid_block" in key:
                             block_id = MID_ID.get(length, 13)
                         elif "up_blocks" in key:
-                            block_id = ids[0]*3 + ids[1] + MID_ID.get(length, 13) + 1 if len(ids) >= 2 else 0
+                            if len(ids) >= 2:
+                                block_id = ids[0]*3 + ids[1] + MID_ID.get(length, 13) + 1
+                            else:
+                                block_id = 0
                             if "up_sampler" in key:
                                 block_id += 2
                         else:
                             block_id = 0
                         
                         if block_id < len(weight_list):
-                            weight = weight_list[block_id]
-                            if weight != 0.0:
-                                lora[key] = lora[key] * weight
-                            else:
-                                keys_to_delete.append(key)
-                                down_key = key.replace("lora_up", "lora_down")
-                                if down_key in lora:
-                                    keys_to_delete.append(down_key)
-                                alpha_key = key.replace("lora_up.weight", "alpha")
-                                if alpha_key in lora:
-                                    keys_to_delete.append(alpha_key)
+                            if block_id not in block_keys:
+                                block_keys[block_id] = []
+                            block_keys[block_id].append(key)
                     
-                    for key in set(keys_to_delete):
-                        if key in lora:
-                            del lora[key]
-            
-            # МАСШТАБИРУЕМ ВЕСА ЗДЕСЬ
+                    # Применяем веса к блокам
+                    for block_id, keys in block_keys.items():
+                        weight = weight_list[block_id]
+                        if weight != 0.0:
+                            # Масштабируем все ключи блока одинаково
+                            sqrt_w = math.sqrt(abs(weight))
+                            sign_w = 1 if weight >= 0 else -1
+                            scale = sqrt_w * sign_w
+                            
+                            for key in keys:
+                                # Масштабируем UP
+                                lora[key] = lora[key] * scale
+                                
+                                # Находим и масштабируем DOWN
+                                down_key = key.replace("lora_up", "lora_down").replace("lora_B", "lora_A")
+                                if down_key in lora:
+                                    lora[down_key] = lora[down_key] * scale
+                        else:
+                            # Удаляем блок
+                            for key in keys:
+                                if key in lora:
+                                    del lora[key]
+                                down_key = key.replace("lora_up", "lora_down").replace("lora_B", "lora_A")
+                                if down_key in lora:
+                                    del lora[down_key]
+                                alpha_key = key.replace("lora_up.weight", "alpha").replace("lora_B.weight", "alpha")
+                                if alpha_key in lora:
+                                    del lora[alpha_key]
+
+            # Применяем глобальное масштабирование
             if strength_model != 1.0 or strength_clip != 1.0:
                 print(f"  • Scaling weights: model={strength_model}, clip={strength_clip}")
-                for key in list(lora.keys()):
+                
+                # Группируем ключи по типу
+                model_keys = []
+                clip_keys = []
+                for key in lora.keys():
                     if "lora_te" in key:
-                        scale = strength_clip
-                    else:
-                        scale = strength_model
-                    if scale != 1.0:
-                        sqrt_scale = math.sqrt(abs(scale))
-                        sign_scale = 1 if scale >= 0 else -1
-                        if "lora_up" in key or "lora_B" in key:
-                            lora[key] = lora[key] * sqrt_scale * sign_scale
-                        elif "lora_down" in key or "lora_A" in key:
-                            lora[key] = lora[key] * sqrt_scale * sign_scale
-            
+                        clip_keys.append(key)
+                    elif "lora_up" in key or "lora_down" in key or "lora_A" in key or "lora_B" in key:
+                        model_keys.append(key)
+                
+                # Масштабируем модель
+                if strength_model != 1.0:
+                    sqrt_model = math.sqrt(abs(strength_model))
+                    sign_model = 1 if strength_model >= 0 else -1
+                    scale_model = sqrt_model * sign_model
+                    for key in model_keys:
+                        lora[key] = lora[key] * scale_model
+                
+                # Масштабируем CLIP
+                if strength_clip != 1.0:
+                    sqrt_clip = math.sqrt(abs(strength_clip))
+                    sign_clip = 1 if strength_clip >= 0 else -1
+                    scale_clip = sqrt_clip * sign_clip
+                    for key in clip_keys:
+                        lora[key] = lora[key] * scale_clip
+
             self.loaded_lora = (lora_path, lora)
             self.lbw = lbw
 
-        # ВОЗВРАЩАЕМ ТОЛЬКО ВЕСА
         return ({"lora": lora}, )
 
     @classmethod

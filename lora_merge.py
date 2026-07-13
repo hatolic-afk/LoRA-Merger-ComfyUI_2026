@@ -18,6 +18,8 @@ class LoraMerger:
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
                 "dtype": (["float32", "float16", "bfloat16"], {"default": "float32"}),
                 "output_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "interp_method": (["slerp", "linear", "cubic", "cosine"], {"default": "slerp"}),
+                "interp_t": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
                 "lora_2": ("LoRA",),
@@ -28,7 +30,7 @@ class LoraMerger:
     FUNCTION = "merge_loras"
     CATEGORY = "lora_merge"
 
-    def merge_loras(self, master_lora, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, lora_2=None):
+    def merge_loras(self, master_lora, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, interp_method="slerp", interp_t=0.5, lora_2=None):
         if lora_2 is None:
             print("⚠️ No lora_2 provided, returning master_lora as-is")
             return (master_lora,)
@@ -37,60 +39,105 @@ class LoraMerger:
             print("⚠️ lora_2 has no data, returning master_lora")
             return (master_lora,)
 
-        # Проверяем, что master_lora имеет данные
         if not master_lora.get("lora", {}):
             print("⚠️ master_lora has no data, returning lora_2")
             return (lora_2,)
 
-        result = self.merge(master_lora, lora_2, mode, rank, threshold, device, dtype, output_scale)
+        result = self.merge(master_lora, lora_2, mode, rank, threshold, device, dtype, output_scale, interp_method, interp_t)
         return (result,)
 
-    def _align_tensors(self, up1, down1, up2, down2):
-        """Выравнивает тензоры для смешивания"""
-        # Если размерности совпадают - возвращаем как есть
-        if up1.dim() == up2.dim() and up1.shape == up2.shape:
-            return up1, down1, up2, down2
-            
-        # Обработка 2D vs 4D
-        if up1.dim() == 2 and up2.dim() == 4:
-            # Конвертируем 4D в 2D (сжимаем пространственные размеры)
-            up2_flat = up2.view(up2.shape[0], -1)
-            down2_flat = down2.view(down2.shape[0], -1)
-            # После смешивания восстановим 4D
-            return up1, down1, up2_flat, down2_flat
-        elif up1.dim() == 4 and up2.dim() == 2:
-            up1_flat = up1.view(up1.shape[0], -1)
-            down1_flat = down1.view(down1.shape[0], -1)
-            return up1_flat, down1_flat, up2, down2
-            
-        # Разные ранги - выравниваем через проекцию
-        if up1.shape[1] != up2.shape[1]:
-            # Проекция на больший ранг
-            if up1.shape[1] < up2.shape[1]:
-                # Дополняем нулями до большего ранга
-                pad_size = up2.shape[1] - up1.shape[1]
-                up1_pad = torch.nn.functional.pad(up1, (0, pad_size))
-                down1_pad = torch.nn.functional.pad(down1, (0, pad_size))
-                return up1_pad, down1_pad, up2, down2
-            else:
-                # Обрезаем до меньшего ранга
-                up2_cut = up2[:, :up1.shape[1]]
-                down2_cut = down2[:, :up1.shape[1]]
-                return up1, down1, up2_cut, down2_cut
-                
-        return up1, down1, up2, down2
-
-    def _restore_shape(self, tensor, original_shape):
-        """Восстанавливает форму тензора"""
-        if tensor.dim() == 2 and len(original_shape) == 4:
-            return tensor.view(original_shape)
+    def _check_and_fix_tensors(self, tensor):
+        """Проверка и исправление nan/inf значений"""
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=-1.0)
         return tensor
 
+    def _normalize_tensor(self, tensor, eps=1e-10):
+        """Нормализация тензора"""
+        norm = torch.norm(tensor)
+        if norm > eps:
+            return tensor / norm
+        return tensor
+
+    def _slerp(self, v1, v2, t, eps=1e-10):
+        """Spherical Linear Interpolation (Сферическая интерполяция) - лучший для нейросетей"""
+        # Нормализация
+        norm1 = torch.norm(v1)
+        norm2 = torch.norm(v2)
+        
+        if norm1 < eps or norm2 < eps:
+            return v1 * (1 - t) + v2 * t
+        
+        v1_norm = v1 / norm1
+        v2_norm = v2 / norm2
+        
+        # Вычисляем угол между векторами
+        dot = torch.clamp(torch.sum(v1_norm * v2_norm), -1.0, 1.0)
+        theta = torch.acos(dot) * t
+        
+        # Slerp формула
+        if torch.abs(dot) < 1.0 - eps:
+            sin_theta = torch.sin(theta)
+            sin_theta_abs = torch.abs(sin_theta)
+            if sin_theta_abs > eps:
+                v1_coeff = torch.sin(theta * (1 - t)) / sin_theta
+                v2_coeff = torch.sin(theta * t) / sin_theta
+            else:
+                v1_coeff = 1 - t
+                v2_coeff = t
+        else:
+            v1_coeff = 1 - t
+            v2_coeff = t
+        
+        result = v1_norm * v1_coeff + v2_norm * v2_coeff
+        # Восстанавливаем масштаб
+        result_norm = torch.norm(result)
+        if result_norm > eps:
+            result = result / result_norm * (norm1 * (1 - t) + norm2 * t)
+        
+        return result
+
+    def _linear_interp(self, v1, v2, t):
+        """Линейная интерполяция"""
+        return v1 * (1 - t) + v2 * t
+
+    def _cubic_interp(self, v1, v2, t):
+        """Кубическая интерполяция - более плавная чем линейная"""
+        t2 = t * t
+        t3 = t2 * t
+        return v1 * (2*t3 - 3*t2 + 1) + v2 * (-2*t3 + 3*t2)
+
+    def _cosine_interp(self, v1, v2, t):
+        """Косинусоидальная интерполяция - плавный S-образный переход"""
+        t_cos = (1 - torch.cos(t * torch.pi)) / 2
+        return v1 * (1 - t_cos) + v2 * t_cos
+
+    def _interpolate(self, up1, down1, up2, down2, t, method="slerp"):
+        """Интерполяция с выбором метода"""
+        if method == "slerp":
+            up = self._slerp(up1, up2, t)
+            down = self._slerp(down1, down2, t)
+        elif method == "linear":
+            up = self._linear_interp(up1, up2, t)
+            down = self._linear_interp(down1, down2, t)
+        elif method == "cubic":
+            up = self._cubic_interp(up1, up2, t)
+            down = self._cubic_interp(down1, down2, t)
+        elif method == "cosine":
+            up = self._cosine_interp(up1, up2, t)
+            down = self._cosine_interp(down1, down2, t)
+        else:
+            up = self._slerp(up1, up2, t)
+            down = self._slerp(down1, down2, t)
+        
+        return up, down
+
     @torch.no_grad()
-    def merge(self, master_lora, lora_2, mode, rank, threshold, device, dtype, output_scale):
+    def merge(self, master_lora, lora_2, mode, rank, threshold, device, dtype, output_scale, interp_method, interp_t):
+        """Основной метод слияния"""
         weight = {}
         dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-        dtype = dtype_map.get(dtype, torch.float32)
+        target_dtype = dtype_map.get(dtype, torch.float32)
         
         if device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
@@ -126,7 +173,6 @@ class LoraMerger:
                     return key[:key.rfind(".lora_B")]
             return None
 
-        # Получаем все уникальные ключи
         keys_1 = set()
         for k in l1_data.keys():
             base = get_base_key(k, suffix1)
@@ -143,6 +189,7 @@ class LoraMerger:
 
         print(f"🔀 Merging {len(all_keys)} modules using mode: {mode}")
         print(f"  master_lora keys: {len(keys_1)}, lora_2 keys: {len(keys_2)}")
+        print(f"  Interpolation method: {interp_method}, t={interp_t}")
 
         if not keys_2:
             print("ℹ️ lora_2 has no base keys, using only master_lora")
@@ -152,7 +199,7 @@ class LoraMerger:
 
         for key in all_keys:
             try:
-                # Формируем ключи для первого LoRA
+                # Формируем ключи для первой лоры
                 if suffix1 == "up/down":
                     up_k1 = key + ".lora_up.weight"
                     down_k1 = key + ".lora_down.weight"
@@ -162,7 +209,7 @@ class LoraMerger:
                     down_k1 = key + ".lora_A.weight"
                     alpha_k1 = key + ".alpha"
 
-                # Формируем ключи для второго LoRA
+                # Формируем ключи для второй лоры
                 if suffix2 == "up/down":
                     up_k2 = key + ".lora_up.weight"
                     down_k2 = key + ".lora_down.weight"
@@ -179,21 +226,21 @@ class LoraMerger:
                     continue
 
                 if not has1:
-                    # Используем только второй
+                    # Только вторая лора
                     up = l2_data[up_k2].clone()
                     down = l2_data[down_k2].clone()
                     alpha = l2_data.get(alpha_k2, torch.tensor(up.shape[1], dtype=torch.int64))
                     if mode == "svd":
-                        up, down = self._svd_single(up, down, rank, threshold, device, dtype)
+                        up, down = self._svd_single(up, down, rank, threshold, device)
                 elif not has2:
-                    # Используем только первый
+                    # Только первая лора
                     up = l1_data[up_k1].clone()
                     down = l1_data[down_k1].clone()
                     alpha = l1_data.get(alpha_k1, torch.tensor(up.shape[1], dtype=torch.int64))
                     if mode == "svd":
-                        up, down = self._svd_single(up, down, rank, threshold, device, dtype)
+                        up, down = self._svd_single(up, down, rank, threshold, device)
                 else:
-                    # Оба присутствуют - смешиваем
+                    # Обе лоры есть - смешиваем
                     up1 = l1_data[up_k1].clone()
                     down1 = l1_data[down_k1].clone()
                     up2 = l2_data[up_k2].clone()
@@ -201,100 +248,131 @@ class LoraMerger:
                     alpha1 = l1_data.get(alpha_k1, torch.tensor(up1.shape[1], dtype=torch.int64))
                     alpha2 = l2_data.get(alpha_k2, torch.tensor(up2.shape[1], dtype=torch.int64))
 
-                    # Сохраняем оригинальные формы для восстановления
-                    orig_shape1 = up1.shape if up1.dim() == 4 else None
-                    orig_shape2 = up2.shape if up2.dim() == 4 else None
-
-                    # Приводим к единому формату для смешивания
-                    up1_flat, down1_flat, up2_flat, down2_flat = self._align_tensors(up1, down1, up2, down2)
+                    # Сохраняем форму
+                    orig_shape1 = up1.shape
+                    orig_shape2 = up2.shape
                     
-                    # Приводим к нужному dtype
-                    up1_flat = up1_flat.to(device, dtype=dtype)
-                    down1_flat = down1_flat.to(device, dtype=dtype)
-                    up2_flat = up2_flat.to(device, dtype=dtype)
-                    down2_flat = down2_flat.to(device, dtype=dtype)
+                    # Приводим к 2D
+                    if up1.dim() == 4:
+                        up1 = up1.view(up1.shape[0], -1)
+                        down1 = down1.view(down1.shape[0], -1)
+                    if up2.dim() == 4:
+                        up2 = up2.view(up2.shape[0], -1)
+                        down2 = down2.view(down2.shape[0], -1)
+                    
+                    up1 = up1.to(device, dtype=target_dtype)
+                    down1 = down1.to(device, dtype=target_dtype)
+                    up2 = up2.to(device, dtype=target_dtype)
+                    down2 = down2.to(device, dtype=target_dtype)
 
-                    # Смешиваем в зависимости от режима
+                    up1 = self._check_and_fix_tensors(up1)
+                    down1 = self._check_and_fix_tensors(down1)
+                    up2 = self._check_and_fix_tensors(up2)
+                    down2 = self._check_and_fix_tensors(down2)
+
+                    # Выравниваем ранги если нужно
+                    rank1 = up1.shape[1]
+                    rank2 = up2.shape[1]
+                    
+                    if rank1 != rank2:
+                        max_rank = max(rank1, rank2)
+                        if rank1 < max_rank:
+                            pad_size = max_rank - rank1
+                            up1 = torch.nn.functional.pad(up1, (0, pad_size))
+                            down1 = torch.nn.functional.pad(down1, (0, pad_size))
+                        if rank2 < max_rank:
+                            pad_size = max_rank - rank2
+                            up2 = torch.nn.functional.pad(up2, (0, pad_size))
+                            down2 = torch.nn.functional.pad(down2, (0, pad_size))
+
+                    # СМЕШИВАНИЕ
                     if mode == "add":
-                        up = up1_flat + up2_flat
-                        down = down1_flat + down2_flat
+                        up = up1 + up2
+                        down = down1 + down2
                         alpha = (alpha1 + alpha2) / 2
 
                     elif mode == "weighted_avg":
-                        up = (up1_flat + up2_flat) / 2
-                        down = (down1_flat + down2_flat) / 2
+                        up = (up1 + up2) / 2
+                        down = (down1 + down2) / 2
                         alpha = (alpha1 + alpha2) / 2
 
                     elif mode == "weighted_sum":
-                        # Нормализованное суммирование
-                        weight1 = 0.5
-                        weight2 = 0.5
-                        up = up1_flat * weight1 + up2_flat * weight2
-                        down = down1_flat * weight1 + down2_flat * weight2
+                        up = up1 + up2
+                        down = down1 + down2
                         alpha = (alpha1 + alpha2) / 2
 
                     elif mode == "interpolate":
-                        t = 0.5
-                        up = up1_flat * (1 - t) + up2_flat * t
-                        down = down1_flat * (1 - t) + down2_flat * t
+                        # ИНТЕРПОЛЯЦИЯ С ВЫБОРОМ МЕТОДА
+                        up, down = self._interpolate(up1, down1, up2, down2, interp_t, interp_method)
                         alpha = (alpha1 + alpha2) / 2
 
                     elif mode == "magnitude":
-                        up_abs1 = torch.abs(up1_flat)
-                        up_abs2 = torch.abs(up2_flat)
-                        up = torch.where(up_abs1 > up_abs2, up1_flat, up2_flat)
+                        up_abs1 = torch.abs(up1)
+                        up_abs2 = torch.abs(up2)
+                        up = torch.where(up_abs1 >= up_abs2, up1, up2)
                         
-                        down_abs1 = torch.abs(down1_flat)
-                        down_abs2 = torch.abs(down2_flat)
-                        down = torch.where(down_abs1 > down_abs2, down1_flat, down2_flat)
-                        alpha = alpha1 if alpha1 > alpha2 else alpha2
+                        down_abs1 = torch.abs(down1)
+                        down_abs2 = torch.abs(down2)
+                        down = torch.where(down_abs1 >= down_abs2, down1, down2)
+                        alpha = alpha1 if alpha1 >= alpha2 else alpha2
 
                     elif mode == "difference":
-                        diff_up = up2_flat - up1_flat
-                        diff_down = down2_flat - down1_flat
-                        threshold_diff = 0.1
-                        mask_up = torch.abs(diff_up) > threshold_diff
-                        mask_down = torch.abs(diff_down) > threshold_diff
-                        up = up1_flat + diff_up * mask_up.float()
-                        down = down1_flat + diff_down * mask_down.float()
+                        up = up1 + (up2 - up1) * 0.5
+                        down = down1 + (down2 - down1) * 0.5
                         alpha = alpha1
 
                     elif mode == "concat":
-                        # Конкатенация - увеличиваем ранг
-                        up = torch.cat([up1_flat, up2_flat], dim=1)
-                        down = torch.cat([down1_flat, down2_flat], dim=0)
+                        up = torch.cat([up1, up2], dim=1)
+                        down = torch.cat([down1, down2], dim=0)
                         alpha = alpha1 + alpha2
 
                     elif mode == "svd":
-                        up, down = self._svd_merge(up1_flat, down1_flat, up2_flat, down2_flat, rank, threshold, device)
+                        weight_matrix = up1 @ down1 + up2 @ down2
+                        U, S, Vh = torch.linalg.svd(weight_matrix, full_matrices=False)
+                        
+                        if threshold < 1.0:
+                            rank = self._index_sv_fro(S, threshold)
+                        rank = min(rank, len(S))
+                        
+                        U = U[:, :rank]
+                        S = S[:rank]
+                        U = U @ torch.diag(S)
+                        Vh = Vh[:rank, :]
+                        
+                        if len(orig_shape1) == 4:
+                            try:
+                                U = U.reshape(up1.shape[0], rank, 1, 1)
+                                Vh = Vh.reshape(rank, down1.shape[1], down1.shape[2], down1.shape[3])
+                            except:
+                                pass
+                        
+                        up = U
+                        down = Vh
                         alpha = torch.tensor(rank, dtype=torch.int64)
 
                     else:
                         print(f"⚠️ Unknown mode: {mode}, using add")
-                        up = up1_flat + up2_flat
-                        down = down1_flat + down2_flat
+                        up = up1 + up2
+                        down = down1 + down2
                         alpha = (alpha1 + alpha2) / 2
 
-                    # Восстанавливаем форму если была 4D
-                    if orig_shape1 is not None and len(orig_shape1) == 4:
+                    # Восстанавливаем форму
+                    if len(orig_shape1) == 4:
                         try:
                             up = up.view(orig_shape1)
-                        except:
-                            # Если не удалось восстановить, оставляем как есть
-                            pass
-                        try:
                             down = down.view(orig_shape1)
                         except:
                             pass
-                    elif orig_shape2 is not None and len(orig_shape2) == 4:
+                    elif len(orig_shape2) == 4:
                         try:
                             up = up.view(orig_shape2)
-                        except:
-                            pass
-                        try:
                             down = down.view(orig_shape2)
                         except:
                             pass
+
+                # Проверяем на nan/inf
+                up = self._check_and_fix_tensors(up)
+                down = self._check_and_fix_tensors(down)
 
                 # Применяем output_scale
                 up = up * output_scale
@@ -302,11 +380,11 @@ class LoraMerger:
 
                 # Записываем результат
                 if suffix1 == "up/down":
-                    weight[key + ".lora_up.weight"] = up.to(device, dtype=dtype)
-                    weight[key + ".lora_down.weight"] = down.to(device, dtype=dtype)
+                    weight[key + ".lora_up.weight"] = up.to(device, dtype=target_dtype)
+                    weight[key + ".lora_down.weight"] = down.to(device, dtype=target_dtype)
                 else:
-                    weight[key + ".lora_B.weight"] = up.to(device, dtype=dtype)
-                    weight[key + ".lora_A.weight"] = down.to(device, dtype=dtype)
+                    weight[key + ".lora_B.weight"] = up.to(device, dtype=target_dtype)
+                    weight[key + ".lora_A.weight"] = down.to(device, dtype=target_dtype)
                 
                 weight[key + ".alpha"] = alpha.to(device)
 
@@ -324,16 +402,14 @@ class LoraMerger:
         print(f"✅ Merged {len(weight)//3} modules with output_scale={output_scale}")
         return {"lora": weight}
 
-    def _svd_single(self, up, down, rank, threshold, device, dtype):
+    def _svd_single(self, up, down, rank, threshold, device):
         org_device = up.device
         org_dtype = up.dtype
-        up = up.to(device)
-        down = down.to(device)
         
-        r = up.shape[1]
-        weight = up.view(-1, r) @ down.view(r, -1)
-        weight = weight.to(torch.float32)
+        up = up.to(device, dtype=torch.float32)
+        down = down.to(device, dtype=torch.float32)
         
+        weight = up @ down
         U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
         
         if threshold < 1.0:
@@ -345,65 +421,14 @@ class LoraMerger:
         U = U @ torch.diag(S)
         Vh = Vh[:rank, :]
         
-        if down.dim() == 4:
-            U = U.reshape(up.shape[0], rank, 1, 1)
-            Vh = Vh.reshape(rank, down.shape[1], down.shape[2], down.shape[3])
-            
-        up = U.to(org_device, dtype=org_dtype)
-        down = Vh.to(org_device, dtype=org_dtype)
-        return up, down
-
-    def _svd_merge(self, up1, down1, up2, down2, rank, threshold, device):
-        org_device = up1.device
-        org_dtype = up1.dtype
-        
-        up1 = up1.to(device)
-        down1 = down1.to(device)
-        up2 = up2.to(device)
-        down2 = down2.to(device)
-        
-        r1 = up1.shape[1]
-        r2 = up2.shape[1]
-        
-        # Если ранги разные, приводим к одному
-        if r1 != r2:
-            if r1 < r2:
-                # Дополняем до большего ранга
-                pad_size = r2 - r1
-                up1 = torch.nn.functional.pad(up1, (0, pad_size))
-                down1 = torch.nn.functional.pad(down1, (0, pad_size))
-                r1 = r2
-            else:
-                # Обрезаем до меньшего ранга
-                up2 = up2[:, :r1]
-                down2 = down2[:, :r1]
-                r2 = r1
-        
-        # Сумма весов
-        weight = (up1.view(-1, r1) @ down1.view(r1, -1)) + (up2.view(-1, r2) @ down2.view(r2, -1))
-        weight = weight.to(torch.float32)
-        
-        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
-        
-        if threshold < 1.0:
-            rank = self._index_sv_fro(S, threshold)
-        rank = min(rank, len(S))
-        
-        U = U[:, :rank]
-        S = S[:rank]
-        U = U @ torch.diag(S)
-        Vh = Vh[:rank, :]
-        
-        if down1.dim() == 4:
+        if len(up.shape) == 4:
             try:
-                U = U.reshape(up1.shape[0], rank, 1, 1)
-                Vh = Vh.reshape(rank, down1.shape[1], down1.shape[2], down1.shape[3])
+                U = U.reshape(up.shape[0], rank, 1, 1)
+                Vh = Vh.reshape(rank, down.shape[1], down.shape[2], down.shape[3])
             except:
                 pass
-            
-        up = U.to(org_device, dtype=org_dtype)
-        down = Vh.to(org_device, dtype=org_dtype)
-        return up, down
+        
+        return U.to(org_device, dtype=org_dtype), Vh.to(org_device, dtype=org_dtype)
 
     def _index_sv_fro(self, S, target):
         S_squared = S.pow(2)
@@ -416,6 +441,7 @@ class LoraMerger:
         return idx
 
     @classmethod
-    def IS_CHANGED(s, master_lora, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, lora_2=None):
+    def IS_CHANGED(s, master_lora, mode="add", rank=16, threshold=1.0, device="cuda", dtype="float32", output_scale=1.0, interp_method="slerp", interp_t=0.5, lora_2=None):
         import hashlib
-        return hashlib.md5(f"{id(master_lora)}_{id(lora_2)}_{mode}_{rank}_{threshold}_{device}_{dtype}_{output_scale}".encode()).hexdigest()
+        key = f"{id(master_lora)}_{id(lora_2)}_{mode}_{rank}_{threshold}_{device}_{dtype}_{output_scale}_{interp_method}_{interp_t}"
+        return hashlib.md5(key.encode()).hexdigest()
