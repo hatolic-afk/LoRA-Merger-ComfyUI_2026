@@ -1,161 +1,129 @@
-================================================================================
-                    LORA MERGE SUITE for ComfyUI
-================================================================================
+# LoRA Merge Suite for ComfyUI
 
-Набор нод для корректного слияния LoRA моделей.
+Набор нод для корректного слияния LoRA моделей без шума.
 
-================================================================================
-НОДЫ
-================================================================================
+## Установка
+Скопировать папку в `ComfyUI/custom_nodes/` и перезапустить ComfyUI.
 
-1. LoraLoaderWeightOnly - загрузка LoRA с весом и LBW
-2. LoraMergerMulti - слияние до 5 LoRA
-3. LoraMerger - слияние 2 LoRA
-4. LoraLoaderFromWeight - применение LoRA к модели
-5. LoraSaveToFile - сохранение LoRA
+## Ноды
 
-================================================================================
-КАК ЭТО РАБОТАЕТ
-================================================================================
+### LoraLoaderWeightOnly
+Загружает LoRA с весом и LBW.
 
-ПРАВИЛЬНАЯ МАТЕМАТИКА:
+**Входы:**
+- `lora_name` - имя файла
+- `weight` - вес (-20.0 … 20.0)
+- `lbw` - per-block веса ("0.8, 0.4, 0.0, 1.0")
 
-Каждая LoRA: ΔW = (alpha / rank) * (up @ down)
+**Выходы:**
+- `LoRA` - загруженная лора
 
-Слияние N лор:
-    W_merged = Σ(ΔW_i)
+---
 
-SVD разложение:
-    U, S, V = svd(W_merged)
-    up_new = U * sqrt(S)
-    down_new = sqrt(S) * V
+### LoraMergerMulti
+Слияние до 5 LoRA.
 
-РЕЗУЛЬТАТ: без шума, без cross-членов.
+**Входы:**
+- `lora_1` … `lora_5` - LoRA для слияния
+- `target_rank` - целевой ранг (1-320)
+- `output_power` - множитель (0.0-2.0)
+- `device` - cuda/cpu
+- `dtype` - float32/float16/bfloat16
+- `use_rsvd` - использовать RSVD
+- `rsvd_oversampling` - (1-50)
+- `rsvd_n_iter` - (0-10)
 
-================================================================================
-LoraLoaderWeightOnly
-================================================================================
+**Выходы:**
+- `LoRA` - слитая лора
 
-Загружает LoRA с применением веса.
+---
 
-ВХОДЫ:
-  lora_name  - имя файла LoRA
-  weight     - вес (-20.0 ... 20.0)
-  lbw        - per-block веса ("0.8, 0.4, 0.0, 1.0")
+### LoraMerger
+Слияние 2 LoRA.
 
-ВЫХОДЫ:
-  LoRA - загруженная лора
+**Входы:**
+- `master_lora` - первая лора
+- `lora_2` - вторая лора
+- `target_rank` - целевой ранг
+- `output_power` - множитель
+- `device` - cuda/cpu
+- `dtype` - float32/float16/bfloat16
+- `use_rsvd` - использовать RSVD
+- `rsvd_oversampling` - (1-50)
+- `rsvd_n_iter` - (0-10)
 
-МАТЕМАТИКА:
-  up   = up * sqrt(|weight|) * sign(weight)
-  down = down * sqrt(|weight|)
+**Выходы:**
+- `LoRA` - слитая лора
 
-================================================================================
-LoraMergerMulti
-================================================================================
+---
 
-Слияние до 5 LoRA в одну.
-
-ВХОДЫ:
-  lora_1 ... lora_5  - LoRA для слияния
-  target_rank        - целевой ранг (1-320)
-  output_power       - множитель (0.0-2.0)
-  device             - cuda/cpu
-  dtype              - float32/float16/bfloat16
-  use_rsvd           - использовать RSVD
-  rsvd_oversampling  - (1-50)
-  rsvd_n_iter        - (0-10)
-
-ВЫХОДЫ:
-  LoRA - слитая лора
-
-ВАЖНО: веса задаются в LoraLoaderWeightOnly.
-
-================================================================================
-LoraMerger (2 inputs)
-================================================================================
-
-Слияние двух LoRA.
-
-ВХОДЫ:
-  master_lora - первая лора
-  lora_2      - вторая лора
-  target_rank - целевой ранг (1-320)
-  output_power - множитель (0.0-2.0)
-  device, dtype, use_rsvd, rsvd_oversampling, rsvd_n_iter
-
-ВЫХОДЫ:
-  LoRA - слитая лора
-
-================================================================================
-LoraLoaderFromWeight
-================================================================================
-
+### LoraLoaderFromWeight
 Применяет LoRA к модели и CLIP.
 
-ВХОДЫ:
-  model          - модель
-  clip           - CLIP
-  lora           - LoRA
-  strength_model - сила для модели (-20.0 ... 20.0)
-  strength_clip  - сила для CLIP (-20.0 ... 20.0)
+**Входы:**
+- `model` - модель
+- `clip` - CLIP
+- `lora` - LoRA
+- `strength_model` - сила (-20.0 … 20.0)
+- `strength_clip` - сила (-20.0 … 20.0)
 
-ВЫХОДЫ:
-  MODEL, CLIP
+**Выходы:**
+- `MODEL`, `CLIP`
 
-================================================================================
-LoraSaveToFile
-================================================================================
+---
 
+### LoraSaveToFile
 Сохраняет LoRA в файл.
 
-ВХОДЫ:
-  lora      - LoRA для сохранения
-  file_name - имя файла
-  extension - safetensors
+**Входы:**
+- `lora` - LoRA
+- `file_name` - имя файла
+- `extension` - safetensors
 
-ВЫХОДЫ:
-  нет (Output Node)
+**Выходы:**
+- нет (Output Node)
 
-================================================================================
-ПРИМЕР WORKFLOW
-================================================================================
+## Пример
+LoraLoaderWeightOnly (lora_1, weight=1.0) → LoRA_1
+LoraLoaderWeightOnly (lora_2, weight=0.8) → LoRA_2
+LoraLoaderWeightOnly (lora_3, weight=1.2) → LoRA_3
 
-1. LoraLoaderWeightOnly (lora_1, weight=1.0)     → LoRA_1
-2. LoraLoaderWeightOnly (lora_2, weight=0.8)     → LoRA_2
-3. LoraLoaderWeightOnly (lora_3, weight=1.2)     → LoRA_3
-4. LoraMergerMulti (
-     lora_1=LoRA_1,
-     lora_2=LoRA_2,
-     lora_3=LoRA_3,
-     target_rank=16,
-     output_power=1.0
-   ) → Merged_LoRA
-5. LoraLoaderFromWeight (model, clip, lora=Merged_LoRA) → готово
-6. LoraSaveToFile (lora=Merged_LoRA, file_name="merged") → сохранение
+LoraMergerMulti (
+lora_1=LoRA_1,
+lora_2=LoRA_2,
+lora_3=LoRA_3,
+target_rank=16,
+output_power=1.0
+) → Merged_LoRA
 
-================================================================================
-ПАРАМЕТРЫ
-================================================================================
+LoraLoaderFromWeight (model, clip, lora=Merged_LoRA) → MODEL, CLIP
+LoraSaveToFile (lora=Merged_LoRA, file_name="merged") → сохранение
 
-target_rank:
-  Рекомендация: 16-32
-  Диапазон: 1-320
 
-output_power:
-  Масштабирование результата
-  Рекомендация: 1.0
-  Диапазон: 0.0-2.0
+## Математика
 
-use_rsvd:
-  Randomized SVD для ускорения
-  Рекомендация: True
+**Проблема:** старое слияние создавало шум.
+up = up1 + up2
+down = down1 + down2
+W = (up1+up2) @ (down1+down2)
+W = up1@down1 + up1@down2 + up2@down1 + up2@down2
 
-================================================================================
-УСТАНОВКА
-================================================================================
 
-1. Скопировать папку в ComfyUI/custom_nodes/
-2. Перезапустить ComfyUI
+`up1@down2` и `up2@down1` — это шум.
 
-================================================================================
+**Решение:** правильное суммирование матриц.
+W_merged = Σ((alpha_i / rank_i) * (up_i @ down_i))
+U, S, V = svd(W_merged)
+up_new = U * sqrt(S)
+down_new = sqrt(S) * V
+
+
+**Результат:** без шума, даже при смешивании 5 лор.
+
+## Параметры
+
+| Параметр | Описание | Рекомендация |
+|----------|----------|--------------|
+| `target_rank` | ранг после сжатия | 16-32 |
+| `output_power` | масштаб результата | 1.0 |
+| `use_rsvd` | Randomized SVD | True |
