@@ -1,6 +1,7 @@
-import comfy
-import folder_paths
 import os
+import folder_paths
+import comfy.utils
+
 
 class LoraSaveToFile:
     def __init__(self):
@@ -8,10 +9,14 @@ class LoraSaveToFile:
 
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "lora": ("LoRA",),
-                              "file_name": ("STRING", {"multiline": False, "default": "merged"}),
-                              "extension": (["safetensors"], ),
-                              }}
+        return {
+            "required": {
+                "lora":      ("LoRA",),
+                "file_name": ("STRING", {"multiline": False, "default": "merged"}),
+                "extension": (["safetensors"],),
+            }
+        }
+
     RETURN_TYPES = ()
     FUNCTION = "save_lora_to_file"
     CATEGORY = "lora_merge"
@@ -19,43 +24,24 @@ class LoraSaveToFile:
 
     def save_lora_to_file(self, lora, file_name, extension):
         if not lora:
-            print("❌ Error: No LoRA data to save")
+            print("❌ No LoRA data")
             return {}
-            
-        lora_data = lora.get("lora", {})
+
+        lora_data = lora.get("lora", {}) if isinstance(lora, dict) else {}
         if not lora_data:
-            print("❌ Error: Empty LoRA data!")
-            print(f"  lora keys: {list(lora.keys())}")
+            print("❌ Empty LoRA data")
             return {}
-            
+
         lora_folder = folder_paths.folder_names_and_paths["loras"][0][0]
         save_path = os.path.join(lora_folder, f"{file_name}.{extension}")
         os.makedirs(lora_folder, exist_ok=True)
-        
+
         try:
             print(f"💾 Saving LoRA to: {save_path}")
-            print(f"  • Total keys: {len(lora_data)}")
-            
-            new_state_dict = lora_data
-            
-            total_size = sum(v.numel() * v.element_size() for v in new_state_dict.values() if hasattr(v, 'numel'))
-            print(f"  • Approximate size: {total_size / 1024 / 1024:.2f} MB")
-            
-            comfy.utils.save_torch_file(new_state_dict, save_path)
-            
-            if os.path.exists(save_path):
-                file_size = os.path.getsize(save_path)
-                print(f"✅ LoRA saved successfully! Size: {file_size / 1024:.2f} KB")
-                if file_size < 1024:
-                    print(f"⚠️ WARNING: File is very small ({file_size} bytes)! Something might be wrong.")
-            else:
-                print(f"❌ Error: File was not created!")
-            
+            comfy.utils.save_torch_file(lora_data, save_path)
+            print(f"✅ LoRA saved! Size: {os.path.getsize(save_path) / 1024:.2f} KB")
         except Exception as e:
             print(f"❌ Error saving LoRA: {e}")
-            import traceback
-            traceback.print_exc()
-            raise e
 
         return {}
 
